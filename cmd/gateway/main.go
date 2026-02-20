@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -66,6 +68,8 @@ func main() {
 		idleTimeout = time.Duration(cfg.IdleTimeoutSec) * time.Second
 	}
 
+	logStartup(cfg, addr)
+
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: r,
@@ -98,6 +102,55 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("stopped")
+}
+
+// logStartup imprime un banner con la config relevante del gateway al arrancar.
+func logStartup(cfg *config.Config, addr string) {
+	sep := "============================================================"
+	dash := "------------------------------------------------------------"
+	slog.Info(sep)
+	slog.Info("  INICIANDO GATEWAY - MaravIA")
+	slog.Info(sep)
+	slog.Info(fmt.Sprintf("  Host         : %s", addr))
+	slog.Info(fmt.Sprintf("  Go version   : %s", runtime.Version()))
+	slog.Info(fmt.Sprintf("  Log level    : %s", cfg.LogLevel))
+	slog.Info(fmt.Sprintf("  CORS origins : %s", cfg.CORSOrigins))
+	slog.Info(dash)
+	slog.Info("  Timeouts HTTP del servidor")
+	slog.Info(fmt.Sprintf("    ReadHeader  : %ds", cfg.ReadHeaderTimeoutSec))
+	slog.Info(fmt.Sprintf("    Read        : %ds", cfg.ReadTimeoutSec))
+	slog.Info(fmt.Sprintf("    Write       : %ds", cfg.WriteTimeoutSec))
+	slog.Info(fmt.Sprintf("    Idle        : %ds", cfg.IdleTimeoutSec))
+	slog.Info(fmt.Sprintf("  Timeout agentes : %ds", cfg.AgentTimeoutSec))
+	slog.Info(dash)
+	slog.Info("  Agentes (puntos de conexión)")
+	logAgent(cfg, "venta", "Ventas")
+	logAgent(cfg, "cita", "Citas")
+	logAgent(cfg, "reserva", "Reservas")
+	logAgent(cfg, "citas_ventas", "Citas y Ventas")
+	slog.Info(dash)
+	slog.Info("  Modalidades → Agente")
+	slog.Info("    Citas           → cita")
+	slog.Info("    Ventas          → venta")
+	slog.Info("    Reservas        → reserva")
+	slog.Info("    Citas y Ventas  → citas_ventas")
+	slog.Info("    (otro/fallback) → cita")
+	slog.Info(dash)
+	slog.Info("  Endpoints")
+	slog.Info("    POST /api/agent/chat")
+	slog.Info("    GET  /health")
+	slog.Info("    GET  /metrics")
+	slog.Info(sep)
+}
+
+func logAgent(cfg *config.Config, key, label string) {
+	enabled := cfg.AgentEnabled(key)
+	url := cfg.AgentURL(key)
+	status := "habilitado"
+	if !enabled {
+		status = "DESHABILITADO"
+	}
+	slog.Info(fmt.Sprintf("    %-18s [%s] %s", label, status, url))
 }
 
 // parseLogLevel convierte el string de env (debug, info, warn, error) a slog.Level. Valor desconocido → info.

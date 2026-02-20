@@ -112,6 +112,13 @@ func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sess
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
+	slog.Debug("→ enviando a agente",
+		"url", url,
+		"session_id", sessionID,
+		"message_preview", msgPreview(message, 80),
+		"context_keys", contextKeys(contextMap),
+	)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return "", fmt.Errorf("new request: %w", err)
@@ -119,13 +126,16 @@ func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sess
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
+	start := time.Now()
 	resp, err := inv.client.Do(req)
 	if err != nil {
+		slog.Warn("← agente no respondió", "url", url, "session_id", sessionID, "err", err, "duration_ms", time.Since(start).Milliseconds())
 		return "", fmt.Errorf("http do: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		slog.Warn("← agente respondió con error", "url", url, "session_id", sessionID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
 		return "", fmt.Errorf("agent returned status %d", resp.StatusCode)
 	}
 
@@ -133,5 +143,31 @@ func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sess
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode response: %w", err)
 	}
+
+	slog.Debug("← respuesta agente",
+		"url", url,
+		"session_id", sessionID,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"reply_preview", msgPreview(out.Reply, 80),
+	)
+
 	return out.Reply, nil
+}
+
+// msgPreview trunca el string a maxLen caracteres para logs.
+func msgPreview(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
+}
+
+// contextKeys devuelve las claves del mapa de contexto (útil para logs de debug sin exponer valores).
+func contextKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

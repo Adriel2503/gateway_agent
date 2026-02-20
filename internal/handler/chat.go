@@ -95,6 +95,15 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	agent := proxy.ModalidadToAgent(req.Config.Modalidad)
 	contextMap := configToMap(req.Config)
 
+	// Log de entrada: qué llega al gateway y a dónde se deriva.
+	slog.Info("→ request entrada",
+		"modalidad", req.Config.Modalidad,
+		"agent", agent,
+		"session_id", req.SessionID,
+		"id_empresa", req.Config.IdEmpresa,
+		"message_preview", preview(req.Message, 80),
+	)
+
 	start := time.Now()
 	reply, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextMap)
 	elapsed := time.Since(start)
@@ -102,11 +111,17 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RequestsTotal.WithLabelValues(agent, "error").Inc()
 		metrics.RequestDurationSeconds.WithLabelValues(agent).Observe(elapsed.Seconds())
-		slog.Warn("agent invoke failed", "agent", agent, "session_id", req.SessionID, "err", err)
-		// Return a safe message to user and delegate action so n8n sees failure path
+		slog.Warn("agent invoke failed", "agent", agent, "session_id", req.SessionID, "err", err, "duration_ms", elapsed.Milliseconds())
+		fallback := "No pude conectar con el agente. Intenta de nuevo en un momento."
+		slog.Info("← respuesta n8n (fallback)",
+			"agent", agent,
+			"session_id", req.SessionID,
+			"status", "fallback",
+			"reply_preview", preview(fallback, 80),
+		)
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(ChatResponse{
-			Reply:     "No pude conectar con el agente. Intenta de nuevo en un momento.",
+			Reply:     fallback,
 			SessionID: req.SessionID,
 			AgentUsed: &agent,
 			Action:    "delegate",
@@ -116,7 +131,12 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	metrics.RequestsTotal.WithLabelValues(agent, "ok").Inc()
 	metrics.RequestDurationSeconds.WithLabelValues(agent).Observe(elapsed.Seconds())
-	slog.Info("chat ok", "agent", agent, "session_id", req.SessionID, "duration_ms", elapsed.Milliseconds())
+	slog.Info("← respuesta n8n (ok)",
+		"agent", agent,
+		"session_id", req.SessionID,
+		"duration_ms", elapsed.Milliseconds(),
+		"reply_preview", preview(reply, 80),
+	)
 	resp := ChatResponse{
 		Reply:     reply,
 		SessionID: req.SessionID,
@@ -162,4 +182,13 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// preview trunca el string a maxLen caracteres y agrega "…" si fue recortado.
+func preview(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
 }

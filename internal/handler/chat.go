@@ -3,8 +3,11 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"gateway/internal/metrics"
@@ -14,6 +17,89 @@ import (
 // MaxRequestBodyBytes es el límite de tamaño del body para POST /api/agent/chat (mitiga DoS por bodies enormes).
 const MaxRequestBodyBytes = 512 * 1024 // 512 KB
 
+// ---------------------------------------------------------------------------
+// Tipos flexibles: n8n puede enviar bool/int/string indistintamente.
+// ---------------------------------------------------------------------------
+
+// FlexBool acepta JSON bool, número (0/1) o string ("0","1","true","false").
+type FlexBool struct {
+	Valid bool
+	Value bool
+}
+
+func (f *FlexBool) UnmarshalJSON(data []byte) error {
+	s := string(data)
+	if s == "null" {
+		f.Valid = false
+		return nil
+	}
+	// bool nativo
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		f.Valid, f.Value = true, b
+		return nil
+	}
+	// número
+	var n float64
+	if err := json.Unmarshal(data, &n); err == nil {
+		f.Valid, f.Value = true, n != 0
+		return nil
+	}
+	// string
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		str = strings.ToLower(strings.TrimSpace(str))
+		f.Valid = true
+		f.Value = str == "1" || str == "true" || str == "yes"
+		return nil
+	}
+	return fmt.Errorf("FlexBool: cannot parse %s", s)
+}
+
+// FlexInt acepta JSON número o string numérico ("15", "3796").
+type FlexInt struct {
+	Valid bool
+	Value int
+}
+
+func (f *FlexInt) UnmarshalJSON(data []byte) error {
+	s := string(data)
+	if s == "null" {
+		f.Valid = false
+		return nil
+	}
+	// número nativo
+	var n int
+	if err := json.Unmarshal(data, &n); err == nil {
+		f.Valid, f.Value = true, n
+		return nil
+	}
+	// float (por si viene 30.0)
+	var fl float64
+	if err := json.Unmarshal(data, &fl); err == nil {
+		f.Valid, f.Value = true, int(fl)
+		return nil
+	}
+	// string numérico
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		str = strings.TrimSpace(str)
+		if v, err := strconv.Atoi(str); err == nil {
+			f.Valid, f.Value = true, v
+			return nil
+		}
+		if v, err := strconv.ParseFloat(str, 64); err == nil {
+			f.Valid, f.Value = true, int(v)
+			return nil
+		}
+	}
+	return fmt.Errorf("FlexInt: cannot parse %s", s)
+}
+
+// ---------------------------------------------------------------------------
+// Structs de request / response
+// ---------------------------------------------------------------------------
+
 // ChatRequest matches the orquestador contract from n8n.
 type ChatRequest struct {
 	Message   string     `json:"message"`
@@ -22,6 +108,7 @@ type ChatRequest struct {
 }
 
 // ChatConfig is the config object inside ChatRequest.
+// Los campos opcionales usan FlexBool/FlexInt para tolerar string, número o bool de n8n.
 type ChatConfig struct {
 	NombreBot    string `json:"nombre_bot"`
 	IdEmpresa    int    `json:"id_empresa"`
@@ -33,13 +120,13 @@ type ChatConfig struct {
 	FraseDes     string `json:"frase_des"`
 	FraseEsc     string `json:"frase_esc"`
 	Personalidad string `json:"personalidad"`
-	// Optional fields n8n may send (forwarded to agents)
-	DuracionCitaMinutos *int   `json:"duracion_cita_minutos,omitempty"`
-	Slots               *int   `json:"slots,omitempty"`
-	AgendarUsuario      *bool  `json:"agendar_usuario,omitempty"`
-	AgendarSucursal     *bool  `json:"agendar_sucursal,omitempty"`
-	UsuarioID           *int   `json:"usuario_id,omitempty"`
-	CorreoUsuario      string `json:"correo_usuario,omitempty"`
+	CorreoUsuario string `json:"correo_usuario,omitempty"`
+	// Campos opcionales que n8n puede enviar como string, número o bool
+	DuracionCitaMinutos FlexInt  `json:"duracion_cita_minutos"`
+	Slots               FlexInt  `json:"slots"`
+	AgendarUsuario      FlexBool `json:"agendar_usuario"`
+	AgendarSucursal     FlexBool `json:"agendar_sucursal"`
+	UsuarioID           FlexInt  `json:"usuario_id"`
 }
 
 // ChatResponse matches the orquestador response to n8n.
@@ -160,20 +247,20 @@ func configToMap(c ChatConfig) map[string]interface{} {
 		"frase_esc":          c.FraseEsc,
 		"correo_usuario":     c.CorreoUsuario,
 	}
-	if c.DuracionCitaMinutos != nil {
-		m["duracion_cita_minutos"] = *c.DuracionCitaMinutos
+	if c.DuracionCitaMinutos.Valid {
+		m["duracion_cita_minutos"] = c.DuracionCitaMinutos.Value
 	}
-	if c.Slots != nil {
-		m["slots"] = *c.Slots
+	if c.Slots.Valid {
+		m["slots"] = c.Slots.Value
 	}
-	if c.AgendarUsuario != nil {
-		m["agendar_usuario"] = *c.AgendarUsuario
+	if c.AgendarUsuario.Valid {
+		m["agendar_usuario"] = c.AgendarUsuario.Value
 	}
-	if c.AgendarSucursal != nil {
-		m["agendar_sucursal"] = *c.AgendarSucursal
+	if c.AgendarSucursal.Valid {
+		m["agendar_sucursal"] = c.AgendarSucursal.Value
 	}
-	if c.UsuarioID != nil {
-		m["usuario_id"] = *c.UsuarioID
+	if c.UsuarioID.Valid {
+		m["usuario_id"] = c.UsuarioID.Value
 	}
 	return m
 }

@@ -128,8 +128,7 @@ Endpoint principal. Recibe el request de n8n, determina el agente por `config.mo
 {
   "reply": "Claro, te ayudare a agendar tu cita. Que dia te conviene?",
   "session_id": 123,
-  "agent_used": "cita",
-  "action": "delegate"
+  "agent_used": "cita"
 }
 ```
 
@@ -139,8 +138,7 @@ Endpoint principal. Recibe el request de n8n, determina el agente por `config.mo
 {
   "reply": "No pude conectar con el agente. Intenta de nuevo en un momento.",
   "session_id": 123,
-  "agent_used": "cita",
-  "action": "delegate"
+  "agent_used": "cita"
 }
 ```
 

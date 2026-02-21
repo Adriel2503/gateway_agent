@@ -134,7 +134,6 @@ type ChatResponse struct {
 	Reply     string  `json:"reply"`
 	SessionID int     `json:"session_id"`
 	AgentUsed *string `json:"agent_used,omitempty"`
-	Action    string  `json:"action"`
 }
 
 // ChatHandler handles POST /api/agent/chat.
@@ -213,7 +212,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Reply:     fallback,
 			SessionID: req.SessionID,
 			AgentUsed: &agent,
-			Action:    "delegate",
 		})
 		return
 	}
@@ -230,7 +228,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Reply:     reply,
 		SessionID: req.SessionID,
 		AgentUsed: &agent,
-		Action:    "delegate",
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

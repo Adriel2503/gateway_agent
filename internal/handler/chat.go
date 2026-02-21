@@ -180,7 +180,9 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agent := proxy.ModalidadToAgent(req.Config.Modalidad)
-	contextMap := configToMap(req.Config)
+	configMap := configToMap(req.Config)
+	// El agente de citas (y otros) esperan context.config con id_empresa, etc.
+	contextForAgent := map[string]interface{}{"config": configMap}
 
 	// Log de entrada: qué llega al gateway y a dónde se deriva.
 	slog.Info("→ request entrada",
@@ -192,7 +194,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	start := time.Now()
-	reply, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextMap)
+	reply, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextForAgent)
 	elapsed := time.Since(start)
 
 	if err != nil {

@@ -102,10 +102,9 @@ func (f *FlexInt) UnmarshalJSON(data []byte) error {
 
 // ChatRequest matches the orquestador contract from n8n.
 type ChatRequest struct {
-	Message     string     `json:"message"`
-	SessionID   int        `json:"session_id"`
-	AgenteNuevo FlexBool   `json:"agente_nuevo"`
-	Config      ChatConfig `json:"config"`
+	Message   string     `json:"message"`
+	SessionID int        `json:"session_id"`
+	Config    ChatConfig `json:"config"`
 }
 
 // ChatConfig is the config object inside ChatRequest.
@@ -183,9 +182,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	agent := proxy.ModalidadToAgent(req.Config.Modalidad)
 	configMap := configToMap(req.Config)
 	contextForAgent := map[string]interface{}{"config": configMap}
-	if req.AgenteNuevo.Valid {
-		contextForAgent["agente_nuevo"] = req.AgenteNuevo.Value
-	}
 
 	// Log de entrada: qué llega al gateway y a dónde se deriva.
 	slog.Info("→ request entrada",

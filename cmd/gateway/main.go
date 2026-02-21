@@ -32,7 +32,16 @@ func main() {
 	}
 
 	level := parseLogLevel(cfg.LogLevel)
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				// Formato legible sin nanosegundos: "2026-02-20 23:56:28"
+				a.Value = slog.StringValue(a.Value.Time().UTC().Format(time.DateTime))
+			}
+			return a
+		},
+	}))
 	slog.SetDefault(logger)
 
 	invoker := proxy.NewInvoker(cfg)

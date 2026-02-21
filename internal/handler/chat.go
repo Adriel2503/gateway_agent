@@ -134,6 +134,7 @@ type ChatResponse struct {
 	Reply     string  `json:"reply"`
 	SessionID int     `json:"session_id"`
 	AgentUsed *string `json:"agent_used,omitempty"`
+	URL       *string `json:"url"`
 }
 
 // ChatHandler handles POST /api/agent/chat.
@@ -193,7 +194,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	start := time.Now()
-	reply, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextForAgent)
+	reply, url, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextForAgent)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -212,6 +213,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Reply:     fallback,
 			SessionID: req.SessionID,
 			AgentUsed: &agent,
+			URL:       nil,
 		})
 		return
 	}
@@ -228,6 +230,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Reply:     reply,
 		SessionID: req.SessionID,
 		AgentUsed: &agent,
+		URL:       url,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

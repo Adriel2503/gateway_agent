@@ -128,7 +128,8 @@ Endpoint principal. Recibe el request de n8n, determina el agente por `config.mo
 {
   "reply": "Claro, te ayudare a agendar tu cita. Que dia te conviene?",
   "session_id": 123,
-  "agent_used": "cita"
+  "agent_used": "cita",
+  "url": null
 }
 ```
 
@@ -138,7 +139,8 @@ Endpoint principal. Recibe el request de n8n, determina el agente por `config.mo
 {
   "reply": "No pude conectar con el agente. Intenta de nuevo en un momento.",
   "session_id": 123,
-  "agent_used": "cita"
+  "agent_used": "cita",
+  "url": null
 }
 ```
 
@@ -288,9 +290,9 @@ Cada agente backend debe exponer:
     }
   }
   ```
-- **Respuesta esperada (200):**
+- **Respuesta esperada (200):** el agente devuelve `reply` y opcionalmente `url`; el gateway reenvía a n8n siempre los cuatro campos (`reply`, `session_id`, `agent_used`, `url`), con `url` en `null` si el agente no lo envía.
   ```json
-  { "reply": "respuesta del agente" }
+  { "reply": "respuesta del agente", "url": null }
   ```
 - **Health check:** `GET /health` retornando 2xx
 

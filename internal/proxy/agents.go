@@ -41,14 +41,21 @@ type AgentRequest struct {
 
 // AgentResponse is the expected response from the agent.
 type AgentResponse struct {
-	Reply string `json:"reply"`
+	Reply string  `json:"reply"`
+	URL   *string `json:"url"`
+}
+
+// agentResult holds reply and optional url from the agent for circuit breaker.
+type agentResult struct {
+	Reply string
+	URL   *string
 }
 
 // Invoker calls agent HTTP endpoints with optional circuit breaker.
 type Invoker struct {
 	cfg    *config.Config
 	client *http.Client
-	cbs    map[string]*gobreaker.CircuitBreaker[string]
+	cbs    map[string]*gobreaker.CircuitBreaker[agentResult]
 }
 
 // NewInvoker creates an invoker with shared HTTP client and per-agent circuit breakers.
@@ -62,10 +69,10 @@ func NewInvoker(cfg *config.Config) *Invoker {
 		},
 	}
 	agents := []string{"venta", "cita", "reserva", "citas_ventas"}
-	cbs := make(map[string]*gobreaker.CircuitBreaker[string], len(agents))
+	cbs := make(map[string]*gobreaker.CircuitBreaker[agentResult], len(agents))
 	for _, name := range agents {
 		name := name
-		cbs[name] = gobreaker.NewCircuitBreaker[string](gobreaker.Settings{
+		cbs[name] = gobreaker.NewCircuitBreaker[agentResult](gobreaker.Settings{
 			Name:        name,
 			MaxRequests: 3,
 			Interval:    60 * time.Second,
@@ -81,27 +88,31 @@ func NewInvoker(cfg *config.Config) *Invoker {
 	return &Invoker{cfg: cfg, client: client, cbs: cbs}
 }
 
-// InvokeAgent calls the agent by name with the given payload. Returns reply or error.
-func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, contextMap map[string]interface{}) (reply string, err error) {
+// InvokeAgent calls the agent by name with the given payload. Returns reply, optional url, or error.
+func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, contextMap map[string]interface{}) (reply string, url *string, err error) {
 	if !inv.cfg.AgentEnabled(agent) {
-		return "", fmt.Errorf("agent %s is disabled", agent)
+		return "", nil, fmt.Errorf("agent %s is disabled", agent)
 	}
-	url := inv.cfg.AgentURL(agent)
-	if url == "" {
-		return "", fmt.Errorf("no URL configured for agent %s", agent)
+	agentURL := inv.cfg.AgentURL(agent)
+	if agentURL == "" {
+		return "", nil, fmt.Errorf("no URL configured for agent %s", agent)
 	}
 
 	cb, ok := inv.cbs[agent]
 	if !ok {
-		return "", fmt.Errorf("unknown agent: %s", agent)
+		return "", nil, fmt.Errorf("unknown agent: %s", agent)
 	}
 
-	return cb.Execute(func() (string, error) {
-		return inv.doHTTP(ctx, url, message, sessionID, contextMap)
+	res, err := cb.Execute(func() (agentResult, error) {
+		return inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
 	})
+	if err != nil {
+		return "", nil, err
+	}
+	return res.Reply, res.URL, nil
 }
 
-func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sessionID int, contextMap map[string]interface{}) (string, error) {
+func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string, sessionID int, contextMap map[string]interface{}) (agentResult, error) {
 	body := AgentRequest{
 		Message:   message,
 		SessionID: sessionID,
@@ -109,19 +120,19 @@ func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sess
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return agentResult{}, fmt.Errorf("marshal request: %w", err)
 	}
 
 	slog.Debug("→ enviando a agente",
-		"url", url,
+		"url", agentURL,
 		"session_id", sessionID,
 		"message_preview", msgPreview(message, 80),
 		"context_keys", contextKeys(contextMap),
 	)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, agentURL, bytes.NewReader(raw))
 	if err != nil {
-		return "", fmt.Errorf("new request: %w", err)
+		return agentResult{}, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -129,29 +140,34 @@ func (inv *Invoker) doHTTP(ctx context.Context, url string, message string, sess
 	start := time.Now()
 	resp, err := inv.client.Do(req)
 	if err != nil {
-		slog.Warn("← agente no respondió", "url", url, "session_id", sessionID, "err", err, "duration_ms", time.Since(start).Milliseconds())
-		return "", fmt.Errorf("http do: %w", err)
+		slog.Warn("← agente no respondió", "url", agentURL, "session_id", sessionID, "err", err, "duration_ms", time.Since(start).Milliseconds())
+		return agentResult{}, fmt.Errorf("http do: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Warn("← agente respondió con error", "url", url, "session_id", sessionID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
-		return "", fmt.Errorf("agent returned status %d", resp.StatusCode)
+		slog.Warn("← agente respondió con error", "url", agentURL, "session_id", sessionID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
+		return agentResult{}, fmt.Errorf("agent returned status %d", resp.StatusCode)
 	}
 
 	var out AgentResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return agentResult{}, fmt.Errorf("decode response: %w", err)
+	}
+
+	url := out.URL
+	if url != nil && *url == "" {
+		url = nil
 	}
 
 	slog.Debug("← respuesta agente",
-		"url", url,
+		"url", agentURL,
 		"session_id", sessionID,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"reply_preview", msgPreview(out.Reply, 80),
 	)
 
-	return out.Reply, nil
+	return agentResult{Reply: out.Reply, URL: url}, nil
 }
 
 // msgPreview trunca el string a maxLen caracteres para logs.

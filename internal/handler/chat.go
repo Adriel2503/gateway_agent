@@ -102,30 +102,30 @@ func (f *FlexInt) UnmarshalJSON(data []byte) error {
 
 // ChatRequest matches the orquestador contract from n8n.
 type ChatRequest struct {
-	Message   string     `json:"message"`
-	SessionID int        `json:"session_id"`
-	Config    ChatConfig `json:"config"`
+	Message     string     `json:"message"`
+	SessionID   int        `json:"session_id"`
+	AgenteNuevo FlexBool   `json:"agente_nuevo"`
+	Config      ChatConfig `json:"config"`
 }
 
 // ChatConfig is the config object inside ChatRequest.
 // Los campos opcionales usan FlexBool/FlexInt para tolerar string, número o bool de n8n.
 type ChatConfig struct {
-	NombreBot    string `json:"nombre_bot"`
-	IdEmpresa    int    `json:"id_empresa"`
-	RolBot       string `json:"rol_bot"`
-	TipoBot      string `json:"tipo_bot"`
-	Objetivo     string `json:"objetivo_principal"`
-	Modalidad    string `json:"modalidad"`
-	FraseSaludo  string `json:"frase_saludo"`
-	FraseDes     string `json:"frase_des"`
-	FraseEsc     string `json:"frase_esc"`
-	Personalidad string `json:"personalidad"`
+	NombreBot     string `json:"nombre_bot"`
+	IdEmpresa     int    `json:"id_empresa"`
+	Modalidad     string `json:"modalidad"`
+	FraseSaludo   string `json:"frase_saludo"`
+	ArchivoSaludo string `json:"archivo_saludo"`
+	Personalidad  string `json:"personalidad"`
+	FraseDes      string `json:"frase_des"`
+	FraseNoSabe   string `json:"frase_no_sabe"`
 	CorreoUsuario string `json:"correo_usuario,omitempty"`
 	// Campos opcionales que n8n puede enviar como string, número o bool
 	DuracionCitaMinutos FlexInt  `json:"duracion_cita_minutos"`
 	Slots               FlexInt  `json:"slots"`
 	AgendarUsuario      FlexBool `json:"agendar_usuario"`
 	AgendarSucursal     FlexBool `json:"agendar_sucursal"`
+	IdProspecto         FlexInt  `json:"id_prospecto"`
 	UsuarioID           FlexInt  `json:"usuario_id"`
 }
 
@@ -181,8 +181,10 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	agent := proxy.ModalidadToAgent(req.Config.Modalidad)
 	configMap := configToMap(req.Config)
-	// El agente de citas (y otros) esperan context.config con id_empresa, etc.
 	contextForAgent := map[string]interface{}{"config": configMap}
+	if req.AgenteNuevo.Valid {
+		contextForAgent["agente_nuevo"] = req.AgenteNuevo.Value
+	}
 
 	// Log de entrada: qué llega al gateway y a dónde se deriva.
 	slog.Info("→ request entrada",
@@ -237,17 +239,15 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func configToMap(c ChatConfig) map[string]interface{} {
 	m := map[string]interface{}{
-		"nombre_bot":         c.NombreBot,
-		"id_empresa":         c.IdEmpresa,
-		"rol_bot":            c.RolBot,
-		"tipo_bot":           c.TipoBot,
-		"objetivo_principal": c.Objetivo,
-		"modalidad":          c.Modalidad,
-		"personalidad":       c.Personalidad,
-		"frase_saludo":       c.FraseSaludo,
-		"frase_des":          c.FraseDes,
-		"frase_esc":          c.FraseEsc,
-		"correo_usuario":     c.CorreoUsuario,
+		"nombre_bot":     c.NombreBot,
+		"id_empresa":     c.IdEmpresa,
+		"frase_saludo":   c.FraseSaludo,
+		"archivo_saludo": c.ArchivoSaludo,
+		"personalidad":   c.Personalidad,
+		"frase_des":      c.FraseDes,
+		"frase_no_sabe":  c.FraseNoSabe,
+		"modalidad":      c.Modalidad,
+		"correo_usuario": c.CorreoUsuario,
 	}
 	if c.DuracionCitaMinutos.Valid {
 		m["duracion_cita_minutos"] = c.DuracionCitaMinutos.Value
@@ -260,6 +260,9 @@ func configToMap(c ChatConfig) map[string]interface{} {
 	}
 	if c.AgendarSucursal.Valid {
 		m["agendar_sucursal"] = c.AgendarSucursal.Value
+	}
+	if c.IdProspecto.Valid {
+		m["id_prospecto"] = c.IdProspecto.Value
 	}
 	if c.UsuarioID.Valid {
 		m["usuario_id"] = c.UsuarioID.Value

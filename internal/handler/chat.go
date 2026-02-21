@@ -106,7 +106,6 @@ type ChatRequest struct {
 	SessionID   int        `json:"session_id"`
 	AgenteNuevo FlexBool   `json:"agente_nuevo"`
 	Config      ChatConfig `json:"config"`
-	IdChatbot   FlexInt    `json:"id_chatbot"`
 }
 
 // ChatConfig is the config object inside ChatRequest.
@@ -128,6 +127,7 @@ type ChatConfig struct {
 	AgendarSucursal     FlexBool `json:"agendar_sucursal"`
 	IdProspecto         FlexInt  `json:"id_prospecto"`
 	UsuarioID           FlexInt  `json:"usuario_id"`
+	IdChatbot           FlexInt  `json:"id_chatbot"`
 }
 
 // ChatResponse matches the orquestador response to n8n.
@@ -186,9 +186,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.AgenteNuevo.Valid {
 		contextForAgent["agente_nuevo"] = req.AgenteNuevo.Value
 	}
-	if req.IdChatbot.Valid {
-		contextForAgent["id_chatbot"] = req.IdChatbot.Value
-	}
 
 	// Log de entrada: qué llega al gateway y a dónde se deriva.
 	slog.Info("→ request entrada",
@@ -196,7 +193,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"agent", agent,
 		"session_id", req.SessionID,
 		"id_empresa", req.Config.IdEmpresa,
-		"id_chatbot", req.IdChatbot.Value,
+		"id_chatbot", req.Config.IdChatbot.Value,
 		"message_preview", preview(req.Message, 80),
 	)
 
@@ -271,6 +268,9 @@ func configToMap(c ChatConfig) map[string]interface{} {
 	}
 	if c.UsuarioID.Valid {
 		m["usuario_id"] = c.UsuarioID.Value
+	}
+	if c.IdChatbot.Valid {
+		m["id_chatbot"] = c.IdChatbot.Value
 	}
 	return m
 }

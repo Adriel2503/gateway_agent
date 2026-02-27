@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -63,9 +64,19 @@ func NewInvoker(cfg *config.Config) *Invoker {
 	client := &http.Client{
 		Timeout: time.Duration(cfg.AgentTimeoutSec) * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        50,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxConnsPerHost:       25,
+			MaxIdleConnsPerHost:   10,
+			MaxIdleConns:          50,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ForceAttemptHTTP2:     false,
+			DisableKeepAlives:     false,
 		},
 	}
 	agents := []string{"venta", "cita", "reserva", "citas_ventas"}
@@ -86,6 +97,11 @@ func NewInvoker(cfg *config.Config) *Invoker {
 		})
 	}
 	return &Invoker{cfg: cfg, client: client, cbs: cbs}
+}
+
+// AgentTimeout returns the configured timeout for agent HTTP calls.
+func (inv *Invoker) AgentTimeout() time.Duration {
+	return time.Duration(inv.cfg.AgentTimeoutSec) * time.Second
 }
 
 // InvokeAgent calls the agent by name with the given payload. Returns reply, optional url, or error.

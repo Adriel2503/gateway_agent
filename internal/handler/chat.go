@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -166,7 +167,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validation (same as orquestador)
-	if req.Message == "" || len(req.Message) == 0 {
+	if strings.TrimSpace(req.Message) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'message' no puede estar vacío"})
 		return
 	}
@@ -193,8 +194,11 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"message_preview", preview(req.Message, 80),
 	)
 
+	agentCtx, cancel := context.WithTimeout(r.Context(), h.Invoker.AgentTimeout())
+	defer cancel()
+
 	start := time.Now()
-	reply, url, err := h.Invoker.InvokeAgent(r.Context(), agent, req.Message, req.SessionID, contextForAgent)
+	reply, url, err := h.Invoker.InvokeAgent(agentCtx, agent, req.Message, req.SessionID, contextForAgent)
 	elapsed := time.Since(start)
 
 	if err != nil {

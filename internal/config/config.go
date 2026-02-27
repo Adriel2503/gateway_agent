@@ -20,8 +20,8 @@ type Config struct {
 
 	// HTTP server timeouts (seconds). Protect against slowloris and hung connections.
 	ReadHeaderTimeoutSec int `env:"GATEWAY_READ_HEADER_TIMEOUT_SEC" env-default:"10"` // max time to read request headers
-	ReadTimeoutSec       int `env:"GATEWAY_READ_TIMEOUT_SEC" env-default:"30"`         // max time to read full request (headers + body)
-	WriteTimeoutSec      int `env:"GATEWAY_WRITE_TIMEOUT_SEC" env-default:"30"`        // max time to write response
+	ReadTimeoutSec       int `env:"GATEWAY_READ_TIMEOUT_SEC" env-default:"40"`         // max time to read full request (headers + body)
+	WriteTimeoutSec      int `env:"GATEWAY_WRITE_TIMEOUT_SEC" env-default:"35"`        // max time to write response; must be > AGENT_TIMEOUT + 5s buffer
 	IdleTimeoutSec      int `env:"GATEWAY_IDLE_TIMEOUT_SEC" env-default:"60"`         // max idle time between requests (keep-alive); 0 = disabled
 
 	// URLs de los agentes (puntos de conexión). POST con message, session_id, context; respuesta JSON: reply.
@@ -35,7 +35,7 @@ type Config struct {
 	AgentReservaEnabled    bool `env:"AGENT_RESERVA_ENABLED" env-default:"true"`
 	AgentCitasVentasEnabled bool `env:"AGENT_CITAS_VENTAS_ENABLED" env-default:"true"`
 
-	AgentTimeoutSec int `env:"AGENT_TIMEOUT" env-default:"30"`
+	AgentTimeoutSec int `env:"AGENT_TIMEOUT" env-default:"25"` // must be < GATEWAY_WRITE_TIMEOUT_SEC - 5s
 }
 
 // Load reads configuration from environment (and optional .env file).

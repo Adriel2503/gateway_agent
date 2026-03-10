@@ -4,34 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"gateway/internal/config"
+	"gateway/internal/agent"
+	"gateway/internal/domain"
+	"gateway/internal/middleware"
 
 	"github.com/sony/gobreaker/v2"
 )
 
-// ModalidadToAgent maps n8n modalidad (valores fijos) a clave de agente. Comparación exacta tras normalizar.
-func ModalidadToAgent(modalidad string) string {
-	m := strings.ToLower(strings.TrimSpace(modalidad))
-	switch m {
-	case "citas":
-		return "cita"
-	case "ventas":
-		return "venta"
-	case "reservas":
-		return "reserva"
-	case "citas y ventas":
-		return "citas_ventas"
-	default:
-		return "cita"
-	}
-}
+// maxConcurrentPerAgent matches MaxConnsPerHost in the Transport.
+const maxConcurrentPerAgent = 25
 
 // AgentRequest is the body sent to the agent HTTP endpoint.
 type AgentRequest struct {
@@ -52,17 +42,18 @@ type agentResult struct {
 	URL   *string
 }
 
-// Invoker calls agent HTTP endpoints with optional circuit breaker.
+// Invoker calls agent HTTP endpoints with circuit breaker and backpressure.
 type Invoker struct {
-	cfg    *config.Config
-	client *http.Client
-	cbs    map[string]*gobreaker.CircuitBreaker[agentResult]
+	registry *agent.Registry
+	client   *http.Client
+	cbs      map[string]*gobreaker.CircuitBreaker[agentResult]
+	sems     map[string]chan struct{} // M1: backpressure per agent
 }
 
 // NewInvoker creates an invoker with shared HTTP client and per-agent circuit breakers.
-func NewInvoker(cfg *config.Config) *Invoker {
+func NewInvoker(agentTimeout time.Duration, registry *agent.Registry) *Invoker {
 	client := &http.Client{
-		Timeout: time.Duration(cfg.AgentTimeoutSec) * time.Second,
+		Timeout: agentTimeout,
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{
 				Timeout:   5 * time.Second,
@@ -79,37 +70,34 @@ func NewInvoker(cfg *config.Config) *Invoker {
 			DisableKeepAlives:     false,
 		},
 	}
-	agents := []string{"venta", "cita", "reserva", "citas_ventas"}
+
+	agents := registry.Keys()
 	cbs := make(map[string]*gobreaker.CircuitBreaker[agentResult], len(agents))
+	sems := make(map[string]chan struct{}, len(agents))
 	for _, name := range agents {
-		name := name
+		sems[name] = make(chan struct{}, maxConcurrentPerAgent)
 		cbs[name] = gobreaker.NewCircuitBreaker[agentResult](gobreaker.Settings{
 			Name:        name,
 			MaxRequests: 3,
 			Interval:    60 * time.Second,
-			Timeout:     60 * time.Second,
+			Timeout:     30 * time.Second,
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
-				return counts.ConsecutiveFailures >= 5
+				return counts.ConsecutiveFailures >= 3
 			},
 			OnStateChange: func(name string, from, to gobreaker.State) {
-				slog.Info("circuit_breaker", "agent", name, "from", from.String(), "to", to.String())
+				slog.Warn("circuit_breaker", "agent", name, "from", from.String(), "to", to.String())
 			},
 		})
 	}
-	return &Invoker{cfg: cfg, client: client, cbs: cbs}
-}
-
-// AgentTimeout returns the configured timeout for agent HTTP calls.
-func (inv *Invoker) AgentTimeout() time.Duration {
-	return time.Duration(inv.cfg.AgentTimeoutSec) * time.Second
+	return &Invoker{registry: registry, client: client, cbs: cbs, sems: sems}
 }
 
 // InvokeAgent calls the agent by name with the given payload. Returns reply, optional url, or error.
 func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, contextMap map[string]interface{}) (reply string, url *string, err error) {
-	if !inv.cfg.AgentEnabled(agent) {
+	if !inv.registry.Enabled(agent) {
 		return "", nil, fmt.Errorf("agent %s is disabled", agent)
 	}
-	agentURL := inv.cfg.AgentURL(agent)
+	agentURL := inv.registry.URL(agent)
 	if agentURL == "" {
 		return "", nil, fmt.Errorf("no URL configured for agent %s", agent)
 	}
@@ -119,12 +107,41 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 		return "", nil, fmt.Errorf("unknown agent: %s", agent)
 	}
 
+	// M1: backpressure — non-blocking semaphore per agent.
+	sem := inv.sems[agent]
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	default:
+		return "", nil, fmt.Errorf("agent %s: backpressure (%d concurrent)", agent, maxConcurrentPerAgent)
+	}
+
+	// M3: retry inside CB so it sees the final result (1 failure, not 2).
 	res, err := cb.Execute(func() (agentResult, error) {
-		return inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
+		result, err := inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
+		if err != nil && isRetryable(err) {
+			select {
+			case <-ctx.Done():
+				return agentResult{}, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+			slog.Debug("retry agente", "url", agentURL, "err", err)
+			return inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
+		}
+		return result, err
 	})
 	if err != nil {
 		return "", nil, err
 	}
+
+	// Defensa en profundidad: el agente deberia siempre retornar reply,
+	// pero si viene vacio lo detectamos aqui. Fuera de cb.Execute para
+	// que el CB no lo cuente como fallo (el agente esta vivo, solo no genero texto).
+	if strings.TrimSpace(res.Reply) == "" {
+		slog.Warn("agent returned empty reply", "agent", agent, "url", agentURL)
+		return "", res.URL, domain.ErrEmptyReply
+	}
+
 	return res.Reply, res.URL, nil
 }
 
@@ -142,7 +159,7 @@ func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string,
 	slog.Debug("→ enviando a agente",
 		"url", agentURL,
 		"session_id", sessionID,
-		"message_preview", msgPreview(message, 80),
+		"message_preview", domain.Preview(message, domain.DefaultPreviewLen),
 		"context_keys", contextKeys(contextMap),
 	)
 
@@ -152,17 +169,23 @@ func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if rid := middleware.GetRequestID(ctx); rid != "" {
+		req.Header.Set("X-Request-ID", rid)
+	}
 
 	start := time.Now()
 	resp, err := inv.client.Do(req)
 	if err != nil {
-		slog.Warn("← agente no respondió", "url", agentURL, "session_id", sessionID, "err", err, "duration_ms", time.Since(start).Milliseconds())
+		slog.Warn("← agente no respondio", "url", agentURL, "session_id", sessionID, "err", err, "duration_ms", time.Since(start).Milliseconds())
 		return agentResult{}, fmt.Errorf("http do: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Warn("← agente respondió con error", "url", agentURL, "session_id", sessionID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
+		slog.Warn("← agente respondio con error", "url", agentURL, "session_id", sessionID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds())
 		return agentResult{}, fmt.Errorf("agent returned status %d", resp.StatusCode)
 	}
 
@@ -171,31 +194,33 @@ func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string,
 		return agentResult{}, fmt.Errorf("decode response: %w", err)
 	}
 
-	url := out.URL
-	if url != nil && *url == "" {
-		url = nil
+	u := out.URL
+	if u != nil && *u == "" {
+		u = nil
 	}
 
 	slog.Debug("← respuesta agente",
 		"url", agentURL,
 		"session_id", sessionID,
 		"duration_ms", time.Since(start).Milliseconds(),
-		"reply_preview", msgPreview(out.Reply, 80),
+		"reply_preview", domain.Preview(out.Reply, domain.DefaultPreviewLen),
 	)
 
-	return agentResult{Reply: out.Reply, URL: url}, nil
+	return agentResult{Reply: out.Reply, URL: u}, nil
 }
 
-// msgPreview trunca el string a maxLen caracteres para logs.
-func msgPreview(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
+// isRetryable returns true for transient connection errors worth retrying.
+// Does NOT retry timeouts (if 5s dial failed, 5.5s won't help) or context cancellation.
+func isRetryable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
 	}
-	return string(runes[:maxLen]) + "…"
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset")
 }
 
-// contextKeys devuelve las claves del mapa de contexto (útil para logs de debug sin exponer valores).
+// contextKeys devuelve las claves del mapa de contexto (util para logs de debug sin exponer valores).
 func contextKeys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

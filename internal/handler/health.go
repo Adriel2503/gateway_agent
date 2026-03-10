@@ -2,28 +2,33 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"sync"
 	"time"
 
-	"gateway/internal/config"
+	"gateway/internal/agent"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const healthCheckTimeout = 2 * time.Second
 
-// HealthHandler handles GET /health. Si cfg != nil, hace un GET a cada agente habilitado
-// en su URL de health (base + /health) y devuelve status "ok" o "degraded" según alcance.
+// AgentLister provides the list of agents for health checks.
+type AgentLister interface {
+	All() []agent.AgentInfo
+}
+
+// HealthHandler handles GET /health.
 type HealthHandler struct {
-	Cfg *config.Config
-	// client con timeout corto para no bloquear el health
+	agents AgentLister
 	client *http.Client
 }
 
-// NewHealthHandler returns a health handler that checks gateway + agents when Cfg is set.
-func NewHealthHandler(cfg *config.Config) *HealthHandler {
+// NewHealthHandler returns a health handler that checks all registered agents.
+func NewHealthHandler(agents AgentLister) *HealthHandler {
 	return &HealthHandler{
-		Cfg: cfg,
+		agents: agents,
 		client: &http.Client{
 			Timeout: healthCheckTimeout,
 		},
@@ -32,49 +37,29 @@ func NewHealthHandler(cfg *config.Config) *HealthHandler {
 
 // ServeHTTP implements http.Handler.
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/health" || r.Method != http.MethodGet {
-		http.NotFound(w, r)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 
-	// Sin config (no debería pasar): solo proceso vivo.
-	if h.Cfg == nil {
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": "gateway",
-		})
-		return
-	}
-
-	agents := map[string]string{}
+	agentInfos := h.agents.All()
+	agentStatuses := make(map[string]string, len(agentInfos))
 	allOK := true
-	for _, name := range []string{"venta", "cita", "reserva", "citas_ventas"} {
-		if !h.Cfg.AgentEnabled(name) {
-			agents[name] = "disabled"
-			continue
-		}
-		healthURL := h.Cfg.AgentHealthURL(name)
-		if healthURL == "" {
-			agents[name] = "no_url"
-			allOK = false
-			continue
-		}
-		resp, err := h.client.Get(healthURL)
-		if err != nil {
-			agents[name] = "unreachable"
-			allOK = false
-			continue
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			agents[name] = "ok"
-		} else {
-			agents[name] = "unreachable"
-			allOK = false
-		}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, a := range agentInfos {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := checkAgent(h.client, a)
+			mu.Lock()
+			agentStatuses[a.Key] = s
+			if s != "ok" && s != "disabled" {
+				allOK = false
+			}
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 
 	status := "ok"
 	code := http.StatusOK
@@ -86,8 +71,28 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  status,
 		"service": "gateway",
-		"agents":  agents,
+		"agents":  agentStatuses,
 	})
+}
+
+// checkAgent verifica la salud de un agente individual.
+func checkAgent(client *http.Client, a agent.AgentInfo) string {
+	if !a.Enabled {
+		return "disabled"
+	}
+	if a.HealthURL == "" {
+		return "no_url"
+	}
+	resp, err := client.Get(a.HealthURL)
+	if err != nil {
+		return "unreachable"
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return "ok"
+	}
+	return "unreachable"
 }
 
 // MetricsHandler returns Prometheus metrics (GET /metrics).

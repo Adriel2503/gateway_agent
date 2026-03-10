@@ -2,9 +2,9 @@
 
 > **Rol del auditor:** Senior Go Engineer & Backend Architect, especializado en API Gateways de alta concurrencia, resiliencia, observabilidad y optimización de CPU/memoria/red.
 >
-> **Fecha:** 2026-02-22
+> **Fecha:** 2026-02-22 (actualizado 2026-03-10)
 >
-> **Versión auditada:** commit `60d6056` (branch `main`)
+> **Versión auditada:** commit `60d6056` → actualizado a `f9140c7` (branch `main`)
 
 ---
 
@@ -31,14 +31,21 @@ El gateway está bien estructurado para un proyecto inicial: layout estándar Go
 
 Sin embargo, hay problemas de producción reales:
 
-- Una **race condition de timeouts** que provoca goroutines zombies bajo carga.
-- **Transporte HTTP suboptimizado** (sin `ResponseHeaderTimeout`, sin `MaxConnsPerHost`).
+- ~~Una **race condition de timeouts** que provoca goroutines zombies bajo carga.~~ ✅ Resuelto (C1)
+- ~~**Transporte HTTP suboptimizado** (sin `ResponseHeaderTimeout`, sin `MaxConnsPerHost`).~~ ✅ Resuelto (C2)
 - **Ausencia de backpressure** (sin límite de concurrencia por agente).
 - **CORS mal configurado** (`Allow-Credentials: true` con wildcard).
 - **Sin autenticación** de requests entrantes.
 - **Gaps en observabilidad** (sin correlation ID, sin métricas de circuit breaker state, sin tracing).
 
-**Score actual: 6.2 / 10.** Con las correcciones críticas y medias listadas puede llegar a **8.5+**.
+**Refactorización SOLID aplicada (2026-03-10):**
+- ✅ OCP: Registry dinámico desde env vars (`AGENT_*_URL`) — agregar agente = solo env var
+- ✅ DIP: Interfaces definidas en el consumidor (`AgentCaller`, `AgentLister`, `RouteFunc`)
+- ✅ ISP: Config slim (solo servidor) + Registry separado (solo agentes)
+- ✅ SRP: Paquetes `domain/` (FlexBool, FlexInt, Preview) y `agent/` (Registry, Routing)
+- ✅ Health checks paralelos con `sync.WaitGroup`
+
+**Score actual: 7.0 / 10** (era 6.2). Con las correcciones medias y mejoras restantes puede llegar a **8.5+**.
 
 ---
 
@@ -77,14 +84,17 @@ n8n
 | Capa | Archivo | Responsabilidad |
 |---|---|---|
 | Entry point | `cmd/gateway/main.go` | Router, server setup, graceful shutdown |
-| Config | `internal/config/config.go` | Env vars → struct, lookup de URLs/flags |
-| Handler | `internal/handler/chat.go` | Decode, validate, orchestrate, respond |
-| Health | `internal/handler/health.go` | Health check compuesto del gateway + agentes |
-| Proxy | `internal/proxy/agents.go` | HTTP call al agente + circuit breaker |
+| Config | `internal/config/config.go` | Env vars → struct (solo servidor HTTP, sin agentes) |
+| Agent Registry | `internal/agent/registry.go` | Registro dinámico de agentes desde `AGENT_*_URL` env vars |
+| Agent Routing | `internal/agent/routing.go` | Mapeo modalidad → agente (`RouteFunc`) |
+| Domain | `internal/domain/flex.go` | Tipos compartidos: `FlexBool`, `FlexInt`, `Preview()` |
+| Handler | `internal/handler/chat.go` | Decode, validate, orchestrate, respond (usa interfaz `AgentCaller`) |
+| Health | `internal/handler/health.go` | Health check paralelo (`sync.WaitGroup`, usa interfaz `AgentLister`) |
+| Proxy | `internal/proxy/agents.go` | HTTP client al agente + circuit breaker (implementa `AgentCaller`) |
 | Middleware | `internal/middleware/` | CORS, logging |
 | Metrics | `internal/metrics/metrics.go` | Prometheus counters + histogramas |
 
-**Evaluación de capas:** La separación es correcta. El único punto de acoplamiento menor es que `ChatHandler` depende del tipo concreto `*proxy.Invoker` en lugar de una interfaz — corrección sencilla pero que facilitaría testing unitario.
+**Evaluación de capas:** ~~El único punto de acoplamiento menor es que `ChatHandler` depende del tipo concreto `*proxy.Invoker` en lugar de una interfaz.~~ ✅ Resuelto — `ChatHandler` ahora depende de la interfaz `AgentCaller` (definida en el consumidor, convención Go). Dependency Inversion aplicado correctamente.
 
 ### Stack tecnológico
 
@@ -107,11 +117,13 @@ n8n
 
 ---
 
-#### C1 — Race condition WriteTimeout vs AgentTimeout: goroutines zombies
+#### C1 — ✅ RESUELTO — Race condition WriteTimeout vs AgentTimeout: goroutines zombies
 
-**Archivos:** `cmd/gateway/main.go` + `internal/proxy/agents.go`
+**Archivos:** `cmd/gateway/main.go` + `internal/handler/chat.go`
 
-**Descripción:** El servidor tiene `WriteTimeout=30s` y el cliente de agentes tiene `AGENT_TIMEOUT=30s`. Ambos iguales es el **peor escenario posible**.
+**Estado:** Resuelto en refactor 2026-03-10. Se agregó `context.WithTimeout` explícito en `ChatHandler.ServeHTTP` con `AgentTimeout` (25s). Timeouts ajustados: `AGENT_TIMEOUT=25s`, `WRITE_TIMEOUT=35s`, `READ_TIMEOUT=40s`. Buffer de 10s entre agente y write timeout.
+
+**Descripción original:** El servidor tenía `WriteTimeout=30s` y el cliente de agentes tenía `AGENT_TIMEOUT=30s`. Ambos iguales es el **peor escenario posible**.
 
 **Secuencia de fallo (escenario 1 — agente lento):**
 
@@ -168,11 +180,20 @@ Esto garantiza que si el agente tarda demasiado, el contexto lo cancela y el han
 
 ---
 
-#### C2 — http.Transport sin `ResponseHeaderTimeout` ni `MaxConnsPerHost`
+#### C2 — ✅ RESUELTO — http.Transport sin `ResponseHeaderTimeout` ni `MaxConnsPerHost`
 
-**Archivo:** `internal/proxy/agents.go:30-38`
+**Archivo:** `internal/proxy/agents.go`
 
-**Código actual:**
+**Estado:** Resuelto en refactor 2026-03-10. Transport completamente configurado con todos los campos recomendados:
+- `DialContext` con Timeout=5s y KeepAlive=30s
+- `MaxConnsPerHost=25`, `MaxIdleConnsPerHost=10`, `MaxIdleConns=50`
+- `ResponseHeaderTimeout=20s`, `TLSHandshakeTimeout=5s`
+- `ForceAttemptHTTP2=false`, `DisableKeepAlives=false`
+
+<details>
+<summary>Descripción original del problema (click para expandir)</summary>
+
+**Código que tenía:**
 
 ```go
 Transport: &http.Transport{
@@ -182,42 +203,13 @@ Transport: &http.Transport{
 }
 ```
 
-**Problema 1 — Sin `ResponseHeaderTimeout`:** Un agente puede aceptar la conexión TCP, enviar el status line `HTTP/1.1 200 OK`, y luego **nunca enviar los headers de respuesta**. El goroutine queda bloqueado hasta que `http.Client.Timeout` expire (30s). Durante ese tiempo: socket abierto, goroutine ocupada, y el agente malgastó una conexión.
+**Problema 1 — Sin `ResponseHeaderTimeout`:** Un agente puede aceptar la conexión TCP, enviar el status line `HTTP/1.1 200 OK`, y luego **nunca enviar los headers de respuesta**. El goroutine queda bloqueado hasta que `http.Client.Timeout` expire (30s).
 
-**Problema 2 — Sin `MaxConnsPerHost`:** Bajo alta concurrencia, Go puede abrir **conexiones TCP ilimitadas** hacia el mismo agente. 200 requests simultáneas = 200 conexiones TCP al mismo host. Esto puede saturar el agente Python (FastAPI/Flask con workers limitados) antes de que el circuit breaker tenga tiempo de reaccionar.
+**Problema 2 — Sin `MaxConnsPerHost`:** Bajo alta concurrencia, Go puede abrir **conexiones TCP ilimitadas** hacia el mismo agente. 200 requests simultáneas = 200 conexiones TCP al mismo host.
 
-**Problema 3 — Sin `DialContext` con timeout:** Si el agente está caído pero el host responde al TCP SYN con RST, la conexión falla rápido. Pero si el host no responde (firewall drop), la conexión espera el timeout de TCP del OS (~2 minutos) en lugar del timeout configurado.
+**Problema 3 — Sin `DialContext` con timeout:** Si el host no responde (firewall drop), la conexión espera el timeout de TCP del OS (~2 minutos).
 
-**Fix — Transport completo y correctamente configurado:**
-
-```go
-import "net"
-
-func newTransport(cfg *config.Config) *http.Transport {
-    return &http.Transport{
-        // Dialer TCP con timeout explícito
-        DialContext: (&net.Dialer{
-            Timeout:   5 * time.Second,  // falla rápido si el agente no responde TCP
-            KeepAlive: 30 * time.Second, // mantiene conexiones vivas entre requests
-        }).DialContext,
-
-        // Límites de conexiones
-        MaxConnsPerHost:     25,  // máx. conexiones activas por host (backpressure TCP)
-        MaxIdleConnsPerHost: 10,  // conexiones idle en el pool por host
-        MaxIdleConns:        50,  // total idle en el pool global
-        IdleConnTimeout:     90 * time.Second,
-
-        // Timeouts granulares a nivel de transporte
-        TLSHandshakeTimeout:   5 * time.Second,
-        ResponseHeaderTimeout: 20 * time.Second, // CRÍTICO: el agente debe enviar headers en 20s
-        ExpectContinueTimeout: 1 * time.Second,
-
-        // HTTP/1.1 (los agentes Python probablemente no soportan HTTP/2)
-        ForceAttemptHTTP2: false,
-        DisableKeepAlives: false, // keepalive = reutilizar conexiones TCP (siempre activado)
-    }
-}
-```
+</details>
 
 ---
 
@@ -287,64 +279,24 @@ func CORS(origins string) func(http.Handler) http.Handler {
 
 ---
 
-#### M1 — Sin backpressure: goroutines acumulables bajo carga
+#### M1 — ✅ RESUELTO — Sin backpressure: goroutines acumulables bajo carga
 
-**Descripción:** No hay límite de concurrencia hacia los agentes. Ante un pico de 200 requests simultáneas:
+**Archivo:** `internal/proxy/agents.go`
 
-- 200 goroutines activas, cada una esperando respuesta del agente (~8 KB por goroutine = ~1.6 MB mínimo, más buffers).
-- Sin `MaxConnsPerHost` (ver C2), Go abre 200 conexiones TCP al agente.
-- El agente Python se satura → latencias crecientes → más goroutines acumuladas → **cascada de fallos**.
+**Estado:** Resuelto 2026-03-10. Semáforo `chan struct{}` por agente, capacidad 25 (= `MaxConnsPerHost`), non-blocking. Si los 25 slots están ocupados → error inmediato "backpressure" → handler devuelve fallback.
 
-El circuit breaker solo actúa después de 5 fallos consecutivos. Mientras tanto, los goroutines se acumulan.
-
-**Fix — semáforo por agente (backpressure limpio):**
-
-```go
-// internal/proxy/agents.go
-
-type Invoker struct {
-    cfg    *config.Config
-    client *http.Client
-    cbs    map[string]*gobreaker.CircuitBreaker[agentResult]
-    sems   map[string]chan struct{} // limitador de concurrencia por agente
-}
-
-// En NewInvoker, inicializar semáforos:
-sems := make(map[string]chan struct{}, len(agents))
-for _, name := range agents {
-    sems[name] = make(chan struct{}, 20) // máx. 20 requests concurrentes por agente
-}
-
-// En InvokeAgent, antes de llamar al circuit breaker:
-sem, ok := inv.sems[agent]
-if ok {
-    select {
-    case sem <- struct{}{}: // adquirir slot
-        defer func() { <-sem }() // liberar al terminar
-    default:
-        // Backpressure: agente saturado, rechazar inmediatamente
-        return "", nil, fmt.Errorf("agent %s: demasiadas requests concurrentes (backpressure)", agent)
-    }
-}
-```
-
-En el handler, mapear este error a **HTTP 503** (no al fallback genérico):
-
-```go
-if errors.Is(err, ErrBackpressure) {
-    w.WriteHeader(http.StatusServiceUnavailable)
-    writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-        "detail": "Servicio temporalmente saturado. Intenta en un momento.",
-    })
-    return
-}
-```
+**Problema original:** Sin límite de concurrencia hacia los agentes. 200 requests simultáneas = 200 goroutines acumulándose sin control.
 
 ---
 
-#### M2 — Circuit breaker tarda demasiado en abrir (150 segundos de fallos lentos)
+#### M2 — ✅ RESUELTO — Circuit breaker tarda demasiado en abrir (150 segundos de fallos lentos)
 
-**Configuración actual:**
+**Archivo:** `internal/proxy/agents.go`
+
+**Estado:** Resuelto 2026-03-10. `ConsecutiveFailures` bajado de 5→3, `Timeout` de 60s→30s, `OnStateChange` log level subido a Warn. Tiempo máximo de exposición: 75s (era 125s).
+
+<details>
+<summary>Configuración que tenía (click para expandir)</summary>
 
 ```go
 ReadyToTrip: func(counts gobreaker.Counts) bool {
@@ -392,11 +344,17 @@ cbs[name] = gobreaker.NewCircuitBreaker[agentResult](gobreaker.Settings{
 
 Con `AgentTimeout=25s` y umbral=3: máximo **75 segundos** antes de que el breaker abra (vs 150s actuales).
 
+</details>
+
 ---
 
-#### M3 — Sin retries para errores de red transitorios
+#### M3 — ✅ RESUELTO — Sin retries para errores de red transitorios
 
-**Descripción:** Un flap de red transitorio o restart del agente Python causa fallo inmediato sin ningún reintento. Para este caso (chatbot con `session_id`), un retry es seguro porque el agente puede manejar mensajes repetidos.
+**Archivo:** `internal/proxy/agents.go`
+
+**Estado:** Resuelto 2026-03-10. 1 retry dentro de `cb.Execute()` para `connection refused` y `connection reset`. Backoff 500ms. No retryable: timeouts, context cancelado, HTTP responses. El CB ve el resultado final (1 fallo, no 2).
+
+**Problema original:** Un restart del agente Python causaba fallo inmediato sin ningún reintento.
 
 **Fix — 1 retry con backoff mínimo para errores de red:**
 
@@ -439,112 +397,33 @@ func (inv *Invoker) doHTTPWithRetry(ctx context.Context, agentURL string, ...) (
 
 ---
 
-#### M4 — Sin X-Request-ID ni correlation ID
+#### M4 — ✅ RESUELTO — Sin X-Request-ID ni correlation ID
 
-**Descripción:** No se genera ni propaga ningún ID de correlación. Es imposible correlacionar un log del gateway con el log correspondiente del agente Python. Si n8n envía un `X-Request-ID`, se descarta silenciosamente.
+**Archivos:** `internal/middleware/request_id.go` (nuevo), `middleware/logger.go`, `handler/chat.go`, `proxy/agents.go`, `cmd/gateway/main.go`
 
-**Fix — middleware de correlation ID:**
+**Estado:** Resuelto 2026-03-10. Middleware `RequestID` genera 16-char hex ID (o usa el de n8n si viene). Se almacena en context, se incluye en todos los logs (logger, handler ×4), se propaga al agente via header `X-Request-ID`, y se devuelve en el response header.
 
-```go
-// internal/middleware/request_id.go
-
-type contextKey string
-const RequestIDKey contextKey = "request_id"
-
-func RequestID(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        id := r.Header.Get("X-Request-ID")
-        if id == "" {
-            // Generar un ID único si n8n no lo envía
-            id = fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())
-        }
-        ctx := context.WithValue(r.Context(), RequestIDKey, id)
-        w.Header().Set("X-Request-ID", id) // devolver al cliente para trazabilidad
-        next.ServeHTTP(w, r.WithContext(ctx))
-    })
-}
-
-func GetRequestID(ctx context.Context) string {
-    if id, ok := ctx.Value(RequestIDKey).(string); ok {
-        return id
-    }
-    return ""
-}
-```
-
-Agregar al router antes de CORS:
-
-```go
-r.Use(middleware.RequestID)
-r.Use(middleware.Logger)
-r.Use(middleware.CORS(cfg.CORSOrigins))
-```
-
-Propagar al agente en `doHTTP`:
-
-```go
-req.Header.Set("X-Request-ID", middleware.GetRequestID(ctx))
-```
-
-Incluir en todos los logs del handler y proxy:
-
-```go
-slog.Info("→ request entrada",
-    "request_id", middleware.GetRequestID(r.Context()),
-    "modalidad", req.Config.Modalidad,
-    // ...
-)
-```
+**Problema original:** Imposible correlacionar logs del gateway con logs del agente Python.
 
 ---
 
-#### M5 — config.Load() no carga el archivo .env en desarrollo local
+#### M5 — ✅ RESUELTO — config.Load() no carga el archivo .env en desarrollo local
 
-**Archivo:** `internal/config/config.go:22`
+**Archivo:** `internal/config/config.go`
 
-**Código actual:**
+**Estado:** Resuelto 2026-03-10. `godotenv.Load()` carga `.env` al OS env si existe. No sobreescribe vars existentes (env vars reales siempre ganan). Si `.env` no existe (producción) se ignora silenciosamente.
 
-```go
-_ = cleanenv.ReadEnv(nil) // ← no hace nada útil
-var c Config
-if err := cleanenv.ReadEnv(&c); err != nil { ... }
-```
-
-**Problema:** `cleanenv.ReadEnv` lee variables **del entorno del proceso** (variables ya exportadas), no de un archivo `.env`. La llamada con `nil` es un no-op. En Docker Compose con `env_file: .env`, las variables ya están inyectadas en el entorno → funciona. Pero al ejecutar `go run ./cmd/gateway` directamente en desarrollo local, **el `.env` no se carga automáticamente**.
-
-**Fix:**
-
-```go
-func Load() (*Config, error) {
-    // Intentar cargar .env si existe (solo para desarrollo local; en Docker ya está en el entorno)
-    if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
-        // No es error crítico si .env no existe (producción sin archivo)
-        slog.Debug("config: .env not found, using environment variables only")
-    }
-    var c Config
-    if err := cleanenv.ReadEnv(&c); err != nil {
-        return nil, fmt.Errorf("config: %w", err)
-    }
-    // ...
-}
-```
+**Problema original:** `cleanenv.ReadEnv(nil)` era un no-op. En dev local con `go run` el `.env` no se cargaba.
 
 ---
 
-#### M6 — ModalidadToAgent: fallback silencioso a "cita"
+#### M6 — ✅ RESUELTO — ModalidadToAgent: fallback silencioso a "cita"
 
-**Archivo:** `internal/proxy/agents.go`
+**Archivo:** `internal/agent/routing.go`
 
-**Código actual:**
+**Estado:** Resuelto 2026-03-10. `slog.Warn` con `modalidad_recibida`, `modalidad_normalizada` y `fallback` antes de retornar el agente por defecto. Las modalidades válidas (citas, ventas, reservas, citas y ventas) nunca disparan el warning.
 
-```go
-default:
-    return "cita" // ← silencioso, sin warning
-```
-
-**Problema:** Si n8n envía una modalidad incorrecta (`"ventas"` con minúscula, `"CITAS"` con mayúscula, un typo, etc.), el gateway lo rutea silenciosamente al agente de citas. En producción esto causa que conversaciones de ventas lleguen al agente de citas sin ningún aviso en los logs.
-
-**Fix — loguear como warning y opcionalmente rechazar:**
+**Problema original:** Modalidad desconocida se ruteaba a "cita" sin aviso en logs.
 
 ```go
 func ModalidadToAgent(modalidad string) string {
@@ -662,41 +541,13 @@ defer metrics.InFlightRequests.WithLabelValues(agent).Dec()
 
 ---
 
-#### G2 — Health check hace requests síncronos secuenciales
+#### G2 — ✅ RESUELTO — Health check hace requests síncronos secuenciales
 
 **Archivo:** `internal/handler/health.go`
 
-**Problema:** Con 4 agentes caídos, cada check espera 2s (timeout) antes de pasar al siguiente. El endpoint `/health` tarda hasta **8 segundos** en responder. Cualquier load balancer con un health check timeout de 1–2s marcará el gateway como caído.
+**Estado:** Resuelto en refactor 2026-03-10. Health checks ahora ejecutan en paralelo con `sync.WaitGroup` + `sync.Mutex`. Usa interfaz `AgentLister` (que `Registry` implementa) en vez de lista hardcodeada. Timeout máximo de `/health` = 2s (un solo check en paralelo), no 8s.
 
-**Fix — checks paralelos con WaitGroup:**
-
-```go
-func (h *HealthHandler) checkAgents() (map[string]string, bool) {
-    agentNames := []string{"venta", "cita", "reserva", "citas_ventas"}
-    results := make(map[string]string, len(agentNames))
-    var mu sync.Mutex
-    var wg sync.WaitGroup
-    allOK := true
-
-    for _, name := range agentNames {
-        wg.Add(1)
-        go func(n string) {
-            defer wg.Done()
-            status := h.checkAgent(n)
-            mu.Lock()
-            results[n] = status
-            if status != "ok" && status != "disabled" {
-                allOK = false
-            }
-            mu.Unlock()
-        }(name)
-    }
-    wg.Wait()
-    return results, allOK
-}
-```
-
-Con esta implementación, el timeout máximo de `/health` es **2 segundos** (un solo check en paralelo), no 8.
+**Problema original:** Con 4 agentes caídos, cada check esperaba 2s (timeout) antes de pasar al siguiente → hasta 8 segundos para responder `/health`.
 
 ---
 
@@ -786,32 +637,27 @@ func (w *responseWriter) Flush() {
 
 ---
 
-#### G6 — .env y .env.example desincronizados
+#### G6 — ✅ RESUELTO — .env y .env.example desincronizados
 
-**Problema:** `.env` no incluye `AGENT_CITAS_VENTAS_URL` ni `AGENT_CITAS_VENTAS_ENABLED`, pero el código sí soporta el agente `citas_ventas`. En runtime se usan los defaults del struct (`http://localhost:8004/api/chat`, `true`), pero no está documentado en `.env`.
+**Estado:** Resuelto en refactor 2026-03-10. Ya no existen campos hardcodeados de agentes en el Config struct. El Registry escanea dinámicamente `AGENT_*_URL` del entorno — `.env.example` documenta el patrón y los agentes actuales. No hay posibilidad de desincronización porque el código no tiene lista fija de agentes.
 
-**Fix:** Sincronizar `.env` con `.env.example`:
-
-```env
-AGENT_CITAS_VENTAS_URL=http://localhost:8004/api/chat
-AGENT_CITAS_VENTAS_ENABLED=true
-```
+**Problema original:** `.env` no incluía `AGENT_CITAS_VENTAS_URL` ni `AGENT_CITAS_VENTAS_ENABLED`, pero el código sí soportaba el agente `citas_ventas`.
 
 ---
 
 ## 4. Riesgos de Producción
 
-| # | Riesgo | Escenario que lo activa | Impacto | Probabilidad |
+| # | Riesgo | Escenario que lo activa | Impacto | Estado |
 |---|---|---|---|---|
-| R1 | **Goroutines zombies** | Agente lento (≥30s), WriteTimeout dispara, goroutine sigue viva | Memory leak gradual, OOM | Alta |
-| R2 | **Cascada de fallos** | 1 agente lento satura el pool → latencias globales suben | Degradación total del servicio | Media |
-| R3 | **TCP socket exhaustion** | Alta carga sin `MaxConnsPerHost` | Agente saturado, `connection refused` | Media |
-| R4 | **Breaker tarda en abrir** | 5 fallos × 30s = 150s de requests lentas antes de apertura | n8n timeouts en cascada | Alta |
-| R5 | **Health check lento** | 4 agentes caídos → 8s para responder `/health` | LB/orchestrator marca gateway como muerto | Media |
-| R6 | **CORS bug** | Browser hace requests (UI futura) con wildcard + credentials | Requests silenciosamente rechazadas por browser | Baja-Media |
-| R7 | **Sin autenticación** | Endpoint accesible desde red no confiable | Abuso, costos de agentes, spam | Depende de red |
-| R8 | **Modalidad silenciosa** | n8n envía modalidad incorrecta | Ventas ruteadas a Citas sin aviso | Media |
-| R9 | **Shutdown brusco** | Requests en vuelo durante deploy/restart | n8n recibe error en mitad de conversación | Media |
+| R1 | ~~**Goroutines zombies**~~ | ~~Agente lento (≥30s), WriteTimeout dispara~~ | ~~Memory leak gradual~~ | ✅ Resuelto (C1) |
+| R2 | ~~**Cascada de fallos**~~ | ~~1 agente lento satura el pool~~ | ~~Degradación total~~ | ✅ Resuelto (M1 semáforo) |
+| R3 | ~~**TCP socket exhaustion**~~ | ~~Alta carga sin `MaxConnsPerHost`~~ | ~~Agente saturado~~ | ✅ Resuelto (C2) |
+| R4 | ~~**Breaker tarda en abrir**~~ | ~~5 fallos × 25s = 125s~~ | ~~n8n timeouts en cascada~~ | ✅ Resuelto (M2: 3 fallos, 30s) |
+| R5 | ~~**Health check lento**~~ | ~~4 agentes caídos → 8s para `/health`~~ | ~~LB marca gateway como muerto~~ | ✅ Resuelto (G2) |
+| R6 | **CORS bug** | Browser hace requests (UI futura) con wildcard + credentials | Requests silenciosamente rechazadas | Pendiente (C3) |
+| R7 | **Sin autenticación** | Endpoint accesible desde red no confiable | Abuso, costos de agentes, spam | Pendiente (G4) |
+| R8 | ~~**Modalidad silenciosa**~~ | ~~n8n envía modalidad incorrecta~~ | ~~Sin aviso en logs~~ | ✅ Resuelto (M6 warning) |
+| R9 | **Shutdown brusco** | Requests en vuelo durante deploy/restart | n8n recibe error en mitad de conversación | Pendiente (G3) |
 
 ### Qué falla primero bajo carga
 
@@ -819,19 +665,19 @@ AGENT_CITAS_VENTAS_ENABLED=true
 Escenario: tráfico creciente de n8n
 
 1. Primero: Agente Python se satura (workers limitados, I/O bound con LLM)
-   → Latencias suben de 3s → 15s → 30s
+   → Latencias suben de 3s → 15s → 25s
 
-2. Segundo: Goroutines del gateway se acumulan (cada request bloqueada 30s)
-   → Memoria del gateway sube
-   → CPU sube por GC pressure
+2. Segundo: Goroutines del gateway se acumulan (cada request bloqueada hasta 25s)
+   → Pero context.WithTimeout cancela a 25s exactos ✅ (C1 resuelto)
+   → Goroutines no se vuelven zombies
 
-3. Tercero: Sin MaxConnsPerHost, el pool TCP del agente se agota
-   → "connection refused" o "too many open files"
+3. Tercero: MaxConnsPerHost=25 limita conexiones TCP por agente ✅ (C2 resuelto)
+   → Ya no hay socket exhaustion ilimitado
 
-4. Cuarto: Sin backpressure (semáforo), el gateway no rechaza requests nuevas
-   → Más goroutines → más memoria → OOM o crash
+4. ⚠️ PENDIENTE: Sin backpressure (semáforo), el gateway no rechaza requests nuevas
+   → Goroutines se acumulan hasta MaxConnsPerHost, pero sin semáforo explícito
 
-5. El circuit breaker abre TARDE (150s) → durante ese tiempo todo está degradado
+5. ⚠️ PENDIENTE: El circuit breaker abre TARDE (5 fallos × 25s = 125s)
 ```
 
 ---
@@ -931,23 +777,23 @@ Para un chatbot de texto esto es más que suficiente. Streaming real (`io.Copy` 
 
 ### Tabla de estado actual vs recomendado
 
-| Mecanismo | Estado actual | Acción recomendada |
+| Mecanismo | Estado actual | Acción |
 |---|---|---|
 | HTTP server ReadHeaderTimeout | ✅ 10s | Mantener |
-| HTTP server ReadTimeout | ✅ 30s | Subir a 40s |
-| HTTP server WriteTimeout | ✅ 30s | Subir a 35s |
+| HTTP server ReadTimeout | ✅ 40s | ✅ Ajustado (era 30s) |
+| HTTP server WriteTimeout | ✅ 35s | ✅ Ajustado (era 30s) |
 | HTTP server IdleTimeout | ✅ 60s | Mantener |
-| http.Client.Timeout | ✅ 30s | Bajar a 25s (< WriteTimeout) |
-| context.WithTimeout en handler | ❌ Falta | Agregar (C1 — crítico) |
-| ResponseHeaderTimeout | ❌ Falta | Agregar 20s en Transport (C2) |
-| DialTimeout | ❌ Falta | Agregar 5s en DialContext (C2) |
-| MaxConnsPerHost | ❌ Falta | Agregar 25 (C2) |
-| Circuit breaker por agente | ✅ gobreaker | Bajar umbral a 3, timeout a 30s (M2) |
-| Backpressure / semáforo | ❌ Falta | Implementar (M1) |
-| Retry con backoff | ❌ Falta | 1 retry para errores de red (M3) |
+| http.Client.Timeout | ✅ 25s | ✅ Ajustado (era 30s) |
+| context.WithTimeout en handler | ✅ 25s | ✅ Resuelto (C1) |
+| ResponseHeaderTimeout | ✅ 20s | ✅ Resuelto (C2) |
+| DialTimeout | ✅ 5s | ✅ Resuelto (C2) |
+| MaxConnsPerHost | ✅ 25 | ✅ Resuelto (C2) |
+| Circuit breaker por agente | ✅ gobreaker | ✅ Resuelto (M2) — umbral 3, timeout 30s |
+| Backpressure / semáforo | ✅ chan struct{} cap 25 | ✅ Resuelto (M1) — non-blocking, per agent |
+| Retry con backoff | ✅ 1 retry, 500ms | ✅ Resuelto (M3) — connection refused/reset |
 | Rate limiting de entrada | ❌ Falta | Considerar golang.org/x/time/rate |
 | Body drain antes de Close | ⚠️ Implícito | Agregar io.Copy(io.Discard, resp.Body) en rutas de error |
-| Graceful shutdown | ✅ 10s | Aumentar a AgentTimeout+10s (G3) |
+| Graceful shutdown | ✅ 10s | Pendiente: Aumentar a AgentTimeout+10s (G3) |
 
 ### Flujo de estados del circuit breaker (corregido)
 
@@ -984,8 +830,8 @@ Cuando `json.Decode` lee el body completamente (caso normal), esto ya se cumple.
 |---|---|---|
 | Logging estructurado | ✅ slog JSON | Bueno, con previews de mensajes |
 | Métricas Prometheus | ⚠️ Básico | Solo requests_total y duration; faltan inflight, circuit state, upstream status |
-| Health check compuesto | ✅ Implementado | Verificar paralelismo (ver G2) |
-| Correlation ID / X-Request-ID | ❌ Falta | Imposible trazar requests cross-service |
+| Health check compuesto | ✅ Paralelo | ✅ Resuelto (G2) — WaitGroup + Mutex, max 2s |
+| Correlation ID / X-Request-ID | ✅ Implementado | ✅ Resuelto (M4) — middleware + propagación al agente + logs |
 | OpenTelemetry tracing | ❌ Falta | Sin spans distribuidos |
 | Log de startup estructurado | ⚠️ Strings crudos | fmt.Sprintf en slog (ver M7) |
 
@@ -1103,28 +949,24 @@ otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 ### Crítico — Antes de ir a producción
 
 ```
-[ ] C1: Agregar context.WithTimeout en ChatHandler (AGENT_TIMEOUT < WRITE_TIMEOUT - 5s)
-[ ] C2: Mejorar http.Transport:
-        - ResponseHeaderTimeout: 20s
-        - MaxConnsPerHost: 25
-        - DialContext con Timeout: 5s y KeepAlive: 30s
-        - TLSHandshakeTimeout: 5s
+[x] C1: Agregar context.WithTimeout en ChatHandler ✅ (resuelto 2026-03-10)
+[x] C2: Mejorar http.Transport (ResponseHeaderTimeout, MaxConnsPerHost, DialContext, TLS) ✅ (resuelto 2026-03-10)
 [ ] C3: Corregir CORS (no Allow-Credentials con wildcard)
-[ ] M1: Implementar semáforo de concurrencia por agente (backpressure)
-[ ] M2: Bajar circuit breaker: ConsecutiveFailures=3, Timeout=30s
-[ ] G6: Sincronizar .env con .env.example (AGENT_CITAS_VENTAS_URL)
+[x] M1: Implementar semáforo de concurrencia por agente ✅ (resuelto 2026-03-10 — chan struct{} cap 25)
+[x] M2: Bajar circuit breaker ✅ (resuelto 2026-03-10 — ConsecutiveFailures=3, Timeout=30s, Warn)
+[x] G6: Sincronizar .env con .env.example ✅ (resuelto — registry dinámico)
 [ ] Ajustar LOG_LEVEL=info en .env de producción
 [ ] Restringir CORS_ALLOWED_ORIGINS a dominios reales en producción
-[ ] Ajustar timeouts: AGENT_TIMEOUT=25, GATEWAY_WRITE_TIMEOUT_SEC=35
+[x] Ajustar timeouts: AGENT_TIMEOUT=25, GATEWAY_WRITE_TIMEOUT_SEC=35 ✅ (resuelto 2026-03-10)
 ```
 
 ### Importante — Primera semana en producción
 
 ```
-[ ] M3: Agregar 1 retry con backoff mínimo para errores de red transitorios
-[ ] M4: Implementar middleware X-Request-ID y propagarlo al agente
-[ ] M6: Agregar warning log en ModalidadToAgent para modalidades desconocidas
-[ ] G2: Paralelizar health checks (tiempo máx. de /health = 2s, no 8s)
+[x] M3: Agregar 1 retry para errores de red transitorios ✅ (resuelto 2026-03-10 — dentro de CB, 500ms backoff)
+[x] M4: Implementar middleware X-Request-ID ✅ (resuelto 2026-03-10 — genera/propaga/logea)
+[x] M6: Warning log en ModalidadToAgent ✅ (resuelto 2026-03-10 — slog.Warn en fallback)
+[x] G2: Paralelizar health checks ✅ (resuelto 2026-03-10 — WaitGroup + Mutex)
 [ ] G3: Aumentar shutdown timeout a AgentTimeout+10s
 [ ] G4: Implementar autenticación mínima (API key header)
 [ ] G1: Agregar métricas: inflight_requests, circuit_breaker_state, upstream_status
@@ -1134,14 +976,14 @@ otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 ### Mejoras — Sprint posterior
 
 ```
-[ ] M5: Cargar .env explícitamente en desarrollo (godotenv.Load())
+[x] M5: Cargar .env en desarrollo ✅ (resuelto 2026-03-10 — godotenv.Load())
 [ ] M7: Refactorizar logStartup a structured logging (sin fmt.Sprintf)
 [ ] G5: Implementar http.Flusher en responseWriter
 [ ] G1: Agregar métricas de error_type (timeout/connection/circuit/decode)
 [ ] Rate limiting de entrada (golang.org/x/time/rate por IP o por cliente)
 [ ] OpenTelemetry tracing con propagación al agente
 [ ] Alertas Prometheus (circuit breaker open, alta latencia, alta tasa de error)
-[ ] ChatHandler: usar interfaz en lugar de *proxy.Invoker (facilita testing)
+[x] ChatHandler: usar interfaz en lugar de *proxy.Invoker ✅ (resuelto — interfaz AgentCaller)
 [ ] Tests de integración con agente mock
 [ ] io.LimitReader en decode de respuesta del agente (10 MB máximo)
 ```
@@ -1152,25 +994,26 @@ otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
 | Dimensión | Score | Fortalezas | Gaps principales |
 |---|---|---|---|
-| Arquitectura y separación de capas | 8/10 | Layout estándar Go, capas claras | ChatHandler acoplado a tipo concreto |
-| Alta concurrencia y backpressure | 4/10 | Goroutines nativas de Go | Sin semáforo, sin MaxConnsPerHost, goroutines zombies |
-| Uso de net/http y Transport | 6/10 | Cliente compartido ✅ | Transport incompleto (sin ResponseHeaderTimeout, sin DialTimeout) |
-| Gestión de recursos (pool, keepalive) | 5/10 | MaxIdleConns configurado | Sin MaxConnsPerHost, sin límite activo |
-| Resiliencia (timeouts, retry, breaker) | 6/10 | Circuit breaker por agente ✅ | Race condition timeout ❌, sin retry ❌, breaker lento ❌ |
-| Observabilidad (logs, métricas, tracing) | 5/10 | slog JSON ✅, Prometheus básico ✅ | Sin X-Request-ID, sin circuit state metrics, sin tracing |
-| Seguridad | 5/10 | Body limit ✅, timeouts ✅ | CORS bug ❌, sin auth ❌, wildcard CORS en producción ❌ |
-| Correctitud del código | 7/10 | FlexBool/FlexInt bien resueltos, ctx propagado | WriteTimeout race condition |
-| **TOTAL ACTUAL** | **6.2 / 10** | Base sólida para MVP | Gaps reales para producción bajo carga |
+| Arquitectura y separación de capas | 9/10 | Interfaces (DIP), Registry dinámico (OCP), domain pkg (SRP) | — |
+| Alta concurrencia y backpressure | 8/10 | Semáforo per-agent cap 25 ✅, MaxConnsPerHost=25 ✅ | — |
+| Uso de net/http y Transport | 9/10 | Transport completo: DialContext, ResponseHeaderTimeout, MaxConnsPerHost, TLS | — |
+| Gestión de recursos (pool, keepalive) | 8/10 | Semáforo + MaxConnsPerHost + DialTimeout + pool tuneado | — |
+| Resiliencia (timeouts, retry, breaker) | 9/10 | context.WithTimeout ✅, retry ✅, CB tuneado (3/30s) ✅ | — |
+| Observabilidad (logs, métricas, tracing) | 7/10 | slog JSON ✅, X-Request-ID ✅, health paralelo ✅, Prometheus básico ✅ | Sin circuit state metrics, sin tracing |
+| Seguridad | 5/10 | Body limit ✅, timeouts ✅ | CORS bug ❌ (C3), sin auth ❌ (G4) |
+| Correctitud del código | 9/10 | FlexBool/FlexInt, context.WithTimeout, interfaces, SOLID, .env loading | — |
+| **TOTAL ACTUAL** | **8.0 / 10** | Resiliencia completa, observabilidad con correlation ID | Gaps de seguridad (C3, G4) |
 
-### Proyección tras aplicar fixes
+### Progreso y proyección
 
-| Fase | Fixes aplicados | Score esperado |
+| Fase | Fixes aplicados | Score |
 |---|---|---|
-| Ahora (MVP) | Ninguno | 6.2 / 10 |
-| Críticos (C1, C2, C3, M1, M2) | Race condition, Transport, CORS, backpressure, breaker | ~7.8 / 10 |
-| Importantes (M3-M6, G2-G4, G6) | Retry, correlación, auth, health paralelo | ~8.5 / 10 |
-| Mejoras (G1, G5, tracing, tests) | Métricas completas, OTel, testing | ~9.0 / 10 |
+| ~~Auditoría inicial (2026-02-22)~~ | Ninguno | ~~6.2 / 10~~ |
+| ~~Refactor SOLID (2026-03-10)~~ | C1, C2, G2, G6 + interfaces + registry + domain | ~~7.0 / 10~~ |
+| **Resiliencia + Observabilidad (2026-03-10)** | M1, M2, M3, M4, M5, M6 | **8.0 / 10** ← actual |
+| Seguridad (C3, G4) | CORS fix, auth API key | ~8.5 / 10 |
+| Mejoras (G1, G3, G5, M7, tracing, tests) | Métricas completas, shutdown, OTel, testing | ~9.0 / 10 |
 
 ---
 
-> **Conclusión:** El código es limpio, idiomático en Go y bien estructurado para un proyecto de tamaño pequeño-mediano. Los problemas identificados no son de diseño fundamental, sino de configuración y mecanismos de resiliencia que se agregan iterativamente. Los dos fixes más urgentes son **C1** (goroutines zombies por race de timeouts) y **C2** (Transport incompleto), ya que son los únicos que pueden causar degradación catastrófica bajo carga real. El resto del sistema seguirá funcional sin ellos, pero con riesgo creciente a medida que escale el tráfico.
+> **Conclusión (actualizada 2026-03-10):** De los 16 hallazgos originales, **12 están resueltos**: C1, C2 (críticos), M1-M6 (medios), G2, G6 (mejoras), más la refactorización SOLID (interfaces, registry, domain). El gateway tiene resiliencia completa (semáforo, CB tuneado, retry, timeouts encadenados), observabilidad con X-Request-ID de punta a punta, y .env loading para desarrollo. **Pendientes: 4 items** — C3 (CORS bug), G1 (métricas avanzadas), G3 (shutdown timeout), G4 (auth), G5 (Flusher), M7 (startup log estructurado). El gap más relevante es seguridad (C3 + G4).

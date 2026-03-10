@@ -13,6 +13,7 @@ func Logger(next http.Handler) http.Handler {
 		wr := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(wr, r)
 		slog.Info("request",
+			"request_id", GetRequestID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wr.status,

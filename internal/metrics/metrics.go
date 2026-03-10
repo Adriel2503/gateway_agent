@@ -1,27 +1,41 @@
 package metrics
 
-// Prometheus client (código en GitHub): https://github.com/prometheus/client_golang/tree/main/prometheus
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-var (
-	// RequestsTotal counts chat requests by agent and status.
-	RequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "gateway_requests_total",
-			Help: "Total chat requests by agent and status",
-		},
-		[]string{"agent", "status"},
-	)
-	// RequestDurationSeconds is the latency of chat requests.
-	RequestDurationSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "gateway_request_duration_seconds",
-			Help:    "Chat request duration in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"agent"},
-	)
-)
+// Recorder wraps Prometheus metrics for chat requests.
+type Recorder struct {
+	requestsTotal   *prometheus.CounterVec
+	requestDuration *prometheus.HistogramVec
+}
+
+// NewRecorder creates a Recorder with registered Prometheus metrics.
+func NewRecorder() *Recorder {
+	return &Recorder{
+		requestsTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "gateway_requests_total",
+				Help: "Total chat requests by agent and status",
+			},
+			[]string{"agent", "status"},
+		),
+		requestDuration: promauto.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "gateway_request_duration_seconds",
+				Help:    "Chat request duration in seconds",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"agent"},
+		),
+	}
+}
+
+// Record registers a completed request with the given agent, status, and duration.
+func (r *Recorder) Record(agent, status string, duration time.Duration) {
+	r.requestsTotal.WithLabelValues(agent, status).Inc()
+	r.requestDuration.WithLabelValues(agent).Observe(duration.Seconds())
+}

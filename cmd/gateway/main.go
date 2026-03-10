@@ -13,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"gateway/internal/agent"
 	"gateway/internal/config"
 	"gateway/internal/handler"
+	"gateway/internal/metrics"
 	"gateway/internal/middleware"
 	"gateway/internal/proxy"
 
@@ -25,7 +27,7 @@ func main() {
 	// Cargar config primero para poder usar LOG_LEVEL al crear el logger.
 	cfg, err := config.Load()
 	if err != nil {
-		// Sin logger aún; usar uno mínimo para reportar el error.
+		// Sin logger aun; usar uno minimo para reportar el error.
 		bootstrap := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 		bootstrap.Error("load config", "err", err)
 		os.Exit(1)
@@ -44,11 +46,25 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	invoker := proxy.NewInvoker(cfg)
-	chatHandler := &handler.ChatHandler{Invoker: invoker}
-	healthHandler := handler.NewHealthHandler(cfg)
+	reg, err := agent.NewRegistryFromEnv()
+	if err != nil {
+		slog.Error("agent registry", "err", err)
+		os.Exit(1)
+	}
+
+	agentTimeout := time.Duration(cfg.AgentTimeoutSec) * time.Second
+	invoker := proxy.NewInvoker(agentTimeout, reg)
+
+	chatHandler := &handler.ChatHandler{
+		Caller:       invoker,
+		Router:       agent.ModalidadToAgent,
+		AgentTimeout: agentTimeout,
+		Metrics:      metrics.NewRecorder(),
+	}
+	healthHandler := handler.NewHealthHandler(reg)
 
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
 	r.Use(middleware.CORS(cfg.CORSOrigins))
 
@@ -77,34 +93,37 @@ func main() {
 		idleTimeout = time.Duration(cfg.IdleTimeoutSec) * time.Second
 	}
 
-	logStartup(cfg, addr)
+	logStartup(cfg, reg, addr)
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: r,
-		// ReadHeaderTimeout: tiempo máximo para leer los headers de la petición. Mitiga slowloris.
+		Addr:              addr,
+		Handler:           r,
 		ReadHeaderTimeout: readHeaderTimeout,
-		// ReadTimeout: tiempo máximo para leer toda la petición (headers + body). Cierra si el cliente tarda demasiado.
-		ReadTimeout: readTimeout,
-		// WriteTimeout: tiempo máximo para escribir la respuesta. Cierra si el cliente no consume a tiempo.
-		WriteTimeout: writeTimeout,
-		// IdleTimeout: tiempo máximo que una conexión keep-alive puede estar idle entre peticiones. 0 = sin límite.
-		IdleTimeout: idleTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
 	}
+	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server", "err", err)
-			os.Exit(1)
+			errCh <- err
 		}
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+
+	select {
+	case sig := <-sigChan:
+		slog.Info("signal received", "signal", sig.String())
+	case err := <-errCh:
+		slog.Error("server failed", "err", err)
+		os.Exit(1)
+	}
 
 	slog.Info("shutting down")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), agentTimeout+5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("shutdown", "err", err)
@@ -114,7 +133,7 @@ func main() {
 }
 
 // logStartup imprime un banner con la config relevante del gateway al arrancar.
-func logStartup(cfg *config.Config, addr string) {
+func logStartup(cfg *config.Config, reg *agent.Registry, addr string) {
 	sep := "============================================================"
 	dash := "------------------------------------------------------------"
 	slog.Info(sep)
@@ -132,18 +151,14 @@ func logStartup(cfg *config.Config, addr string) {
 	slog.Info(fmt.Sprintf("    Idle        : %ds", cfg.IdleTimeoutSec))
 	slog.Info(fmt.Sprintf("  Timeout agentes : %ds", cfg.AgentTimeoutSec))
 	slog.Info(dash)
-	slog.Info("  Agentes (puntos de conexión)")
-	logAgent(cfg, "venta", "Ventas")
-	logAgent(cfg, "cita", "Citas")
-	logAgent(cfg, "reserva", "Reservas")
-	logAgent(cfg, "citas_ventas", "Citas y Ventas")
-	slog.Info(dash)
-	slog.Info("  Modalidades → Agente")
-	slog.Info("    Citas           → cita")
-	slog.Info("    Ventas          → venta")
-	slog.Info("    Reservas        → reserva")
-	slog.Info("    Citas y Ventas  → citas_ventas")
-	slog.Info("    (otro/fallback) → cita")
+	slog.Info("  Agentes (puntos de conexion)")
+	for _, a := range reg.All() {
+		status := "habilitado"
+		if !a.Enabled {
+			status = "DESHABILITADO"
+		}
+		slog.Info(fmt.Sprintf("    %-18s [%s] %s", a.Key, status, a.URL))
+	}
 	slog.Info(dash)
 	slog.Info("  Endpoints")
 	slog.Info("    POST /api/agent/chat")
@@ -152,17 +167,7 @@ func logStartup(cfg *config.Config, addr string) {
 	slog.Info(sep)
 }
 
-func logAgent(cfg *config.Config, key, label string) {
-	enabled := cfg.AgentEnabled(key)
-	url := cfg.AgentURL(key)
-	status := "habilitado"
-	if !enabled {
-		status = "DESHABILITADO"
-	}
-	slog.Info(fmt.Sprintf("    %-18s [%s] %s", label, status, url))
-}
-
-// parseLogLevel convierte el string de env (debug, info, warn, error) a slog.Level. Valor desconocido → info.
+// parseLogLevel convierte el string de env (debug, info, warn, error) a slog.Level. Valor desconocido -> info.
 func parseLogLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":

@@ -27,7 +27,7 @@ const maxConcurrentPerAgent = 25
 type AgentRequest struct {
 	Message   string                 `json:"message"`
 	SessionID int                    `json:"session_id"`
-	Context   map[string]interface{} `json:"context"`
+	Config    map[string]interface{} `json:"config"`
 }
 
 // AgentResponse is the expected response from the agent.
@@ -93,7 +93,7 @@ func NewInvoker(agentTimeout time.Duration, registry *agent.Registry) *Invoker {
 }
 
 // InvokeAgent calls the agent by name with the given payload. Returns reply, optional url, or error.
-func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, contextMap map[string]interface{}) (reply string, url *string, err error) {
+func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, configMap map[string]interface{}) (reply string, url *string, err error) {
 	if !inv.registry.Enabled(agent) {
 		return "", nil, fmt.Errorf("agent %s is disabled", agent)
 	}
@@ -118,7 +118,7 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 
 	// M3: retry inside CB so it sees the final result (1 failure, not 2).
 	res, err := cb.Execute(func() (agentResult, error) {
-		result, err := inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
+		result, err := inv.doHTTP(ctx, agentURL, message, sessionID, configMap)
 		if err != nil && isRetryable(err) {
 			select {
 			case <-ctx.Done():
@@ -126,7 +126,7 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 			case <-time.After(500 * time.Millisecond):
 			}
 			slog.Debug("retry agente", "url", agentURL, "err", err)
-			return inv.doHTTP(ctx, agentURL, message, sessionID, contextMap)
+			return inv.doHTTP(ctx, agentURL, message, sessionID, configMap)
 		}
 		return result, err
 	})
@@ -145,11 +145,11 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 	return res.Reply, res.URL, nil
 }
 
-func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string, sessionID int, contextMap map[string]interface{}) (agentResult, error) {
+func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string, sessionID int, configMap map[string]interface{}) (agentResult, error) {
 	body := AgentRequest{
 		Message:   message,
 		SessionID: sessionID,
-		Context:   contextMap,
+		Config:    configMap,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -160,7 +160,7 @@ func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string,
 		"url", agentURL,
 		"session_id", sessionID,
 		"message_preview", domain.Preview(message, domain.DefaultPreviewLen),
-		"context_keys", contextKeys(contextMap),
+		"config_keys", contextKeys(configMap),
 	)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, agentURL, bytes.NewReader(raw))

@@ -38,15 +38,16 @@ type MetricsRecorder interface {
 type ChatRequest struct {
 	Message   string     `json:"message"`
 	SessionID int        `json:"session_id"`
+	IdEmpresa int        `json:"id_empresa"`
+	ApiKey    string     `json:"api_key"`
 	Config    ChatConfig `json:"config"`
 }
 
 // ChatConfig is the config object inside ChatRequest.
 // Los campos opcionales usan FlexBool/FlexInt para tolerar string, numero o bool de n8n.
 type ChatConfig struct {
-	NombreBot     string `json:"nombre_bot"`
-	IdEmpresa     int    `json:"id_empresa"`
-	Modalidad     string `json:"modalidad"`
+	NombreBot string `json:"nombre_bot"`
+	Modalidad string `json:"modalidad"`
 	FraseSaludo   string `json:"frase_saludo"`
 	ArchivoSaludo string `json:"archivo_saludo"`
 	Personalidad  string `json:"personalidad"`
@@ -54,13 +55,12 @@ type ChatConfig struct {
 	FraseNoSabe   string `json:"frase_no_sabe"`
 	CorreoUsuario string `json:"correo_usuario,omitempty"`
 	// Campos opcionales que n8n puede enviar como string, numero o bool
-	DuracionCitaMinutos domain.FlexInt  `json:"duracion_cita_minutos"`
-	Slots               domain.FlexInt  `json:"slots"`
+	DuracionCitaMinutos int             `json:"duracion_cita_minutos"`
+	Slots               int             `json:"slots"`
 	AgendarUsuario      domain.FlexBool `json:"agendar_usuario"`
 	AgendarSucursal     domain.FlexBool `json:"agendar_sucursal"`
-	IdProspecto         domain.FlexInt  `json:"id_prospecto"`
-	UsuarioID           domain.FlexInt  `json:"usuario_id"`
-	IdChatbot           domain.FlexInt  `json:"id_chatbot"`
+	UsuarioID           int             `json:"usuario_id"`
+	IdChatbot           int             `json:"id_chatbot"`
 }
 
 // ChatResponse matches the orquestador response to n8n.
@@ -102,17 +102,29 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'message' no puede estar vacio"})
 		return
 	}
-	if req.SessionID < 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'session_id' debe ser un entero no negativo"})
+	if req.SessionID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'session_id' debe ser un entero mayor a 0"})
 		return
 	}
-	if req.Config.IdEmpresa <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'config.id_empresa' debe ser un numero mayor a 0"})
+	if strings.TrimSpace(req.ApiKey) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'api_key' no puede estar vacio"})
+		return
+	}
+	if strings.TrimSpace(req.Config.Modalidad) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'config.modalidad' no puede estar vacio"})
+		return
+	}
+	if req.IdEmpresa <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "El campo 'id_empresa' debe ser un numero mayor a 0"})
 		return
 	}
 
 	agent := h.Router(req.Config.Modalidad)
-	configMap := configToMap(req.Config)
+	if agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "Modalidad no reconocida: " + req.Config.Modalidad})
+		return
+	}
+	configMap := configToMap(req.Config, req.IdEmpresa)
 
 	// Log de entrada: que llega al gateway y a donde se deriva.
 	rid := middleware.GetRequestID(r.Context())
@@ -121,8 +133,8 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"modalidad", req.Config.Modalidad,
 		"agent", agent,
 		"session_id", req.SessionID,
-		"id_empresa", req.Config.IdEmpresa,
-		"id_chatbot", req.Config.IdChatbot.Value,
+		"id_empresa", req.IdEmpresa,
+		"id_chatbot", req.Config.IdChatbot,
 		"message_preview", domain.Preview(req.Message, domain.DefaultPreviewLen),
 	)
 
@@ -178,10 +190,10 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func configToMap(c ChatConfig) map[string]interface{} {
+func configToMap(c ChatConfig, idEmpresa int) map[string]interface{} {
 	m := map[string]interface{}{
 		"nombre_bot":     c.NombreBot,
-		"id_empresa":     c.IdEmpresa,
+		"id_empresa":     idEmpresa,
 		"frase_saludo":   c.FraseSaludo,
 		"archivo_saludo": c.ArchivoSaludo,
 		"personalidad":   c.Personalidad,
@@ -190,27 +202,16 @@ func configToMap(c ChatConfig) map[string]interface{} {
 		"modalidad":      c.Modalidad,
 		"correo_usuario": c.CorreoUsuario,
 	}
-	if c.DuracionCitaMinutos.Valid {
-		m["duracion_cita_minutos"] = c.DuracionCitaMinutos.Value
-	}
-	if c.Slots.Valid {
-		m["slots"] = c.Slots.Value
-	}
+	m["duracion_cita_minutos"] = c.DuracionCitaMinutos
+	m["slots"] = c.Slots
 	if c.AgendarUsuario.Valid {
 		m["agendar_usuario"] = c.AgendarUsuario.Value
 	}
 	if c.AgendarSucursal.Valid {
 		m["agendar_sucursal"] = c.AgendarSucursal.Value
 	}
-	if c.IdProspecto.Valid {
-		m["id_prospecto"] = c.IdProspecto.Value
-	}
-	if c.UsuarioID.Valid {
-		m["usuario_id"] = c.UsuarioID.Value
-	}
-	if c.IdChatbot.Valid {
-		m["id_chatbot"] = c.IdChatbot.Value
-	}
+	m["usuario_id"] = c.UsuarioID
+	m["id_chatbot"] = c.IdChatbot
 	return m
 }
 

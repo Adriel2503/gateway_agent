@@ -22,7 +22,7 @@ const emptyReplyMsg = "El agente especializado no pudo generar una respuesta. In
 
 // AgentCaller invokes a downstream agent.
 type AgentCaller interface {
-	InvokeAgent(ctx context.Context, agent, message string, sessionID int, configMap map[string]interface{}) (reply string, url *string, err error)
+	InvokeAgent(ctx context.Context, agent, message string, sessionID int, idEmpresa int, configMap map[string]interface{}) (reply string, url *string, err error)
 }
 
 // MetricsRecorder records request metrics.
@@ -44,7 +44,7 @@ type ChatRequest struct {
 }
 
 // ChatConfig is the config object inside ChatRequest.
-// Los campos opcionales usan FlexBool/FlexInt para tolerar string, numero o bool de n8n.
+// Los campos opcionales de tipo bool usan FlexBool para tolerar string, numero o bool de n8n.
 type ChatConfig struct {
 	NombreBot string `json:"nombre_bot"`
 	Modalidad string `json:"modalidad"`
@@ -124,7 +124,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "Modalidad no reconocida: " + req.Config.Modalidad})
 		return
 	}
-	configMap := configToMap(req.Config, req.IdEmpresa)
+	configMap := configToMap(req.Config)
 
 	// Log de entrada: que llega al gateway y a donde se deriva.
 	rid := middleware.GetRequestID(r.Context())
@@ -142,7 +142,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	start := time.Now()
-	reply, url, err := h.Caller.InvokeAgent(agentCtx, agent, req.Message, req.SessionID, configMap)
+	reply, url, err := h.Caller.InvokeAgent(agentCtx, agent, req.Message, req.SessionID, req.IdEmpresa, configMap)
 	elapsed := time.Since(start)
 
 	status := "ok"
@@ -164,8 +164,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"status", "fallback",
 			"reply_preview", domain.Preview(fallback, domain.DefaultPreviewLen),
 		)
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(ChatResponse{
+		writeJSON(w, http.StatusOK, ChatResponse{
 			Reply:     fallback,
 			SessionID: req.SessionID,
 			AgentUsed: &agent,
@@ -190,10 +189,9 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func configToMap(c ChatConfig, idEmpresa int) map[string]interface{} {
+func configToMap(c ChatConfig) map[string]interface{} {
 	m := map[string]interface{}{
 		"nombre_bot":     c.NombreBot,
-		"id_empresa":     idEmpresa,
 		"frase_saludo":   c.FraseSaludo,
 		"archivo_saludo": c.ArchivoSaludo,
 		"personalidad":   c.Personalidad,

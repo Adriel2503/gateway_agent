@@ -28,6 +28,7 @@ type AgentRequest struct {
 	Message   string                 `json:"message"`
 	SessionID int                    `json:"session_id"`
 	IdEmpresa int                    `json:"id_empresa"`
+	ApiKey    string                 `json:"api_key"`
 	Config    map[string]interface{} `json:"config"`
 }
 
@@ -94,7 +95,7 @@ func NewInvoker(agentTimeout time.Duration, registry *agent.Registry) *Invoker {
 }
 
 // InvokeAgent calls the agent by name with the given payload. Returns reply, optional url, or error.
-func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, idEmpresa int, configMap map[string]interface{}) (reply string, url *string, err error) {
+func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message string, sessionID int, idEmpresa int, apiKey string, configMap map[string]interface{}) (reply string, url *string, err error) {
 	if !inv.registry.Enabled(agent) {
 		return "", nil, fmt.Errorf("agent %s is disabled", agent)
 	}
@@ -119,7 +120,7 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 
 	// M3: retry inside CB so it sees the final result (1 failure, not 2).
 	res, err := cb.Execute(func() (agentResult, error) {
-		result, err := inv.doHTTP(ctx, agentURL, message, sessionID, idEmpresa, configMap)
+		result, err := inv.doHTTP(ctx, agentURL, message, sessionID, idEmpresa, apiKey, configMap)
 		if err != nil && isRetryable(err) {
 			select {
 			case <-ctx.Done():
@@ -146,11 +147,12 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 	return res.Reply, res.URL, nil
 }
 
-func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string, sessionID int, idEmpresa int, configMap map[string]interface{}) (agentResult, error) {
+func (inv *Invoker) doHTTP(ctx context.Context, agentURL string, message string, sessionID int, idEmpresa int, apiKey string, configMap map[string]interface{}) (agentResult, error) {
 	body := AgentRequest{
 		Message:   message,
 		SessionID: sessionID,
 		IdEmpresa: idEmpresa,
+		ApiKey:    apiKey,
 		Config:    configMap,
 	}
 	raw, err := json.Marshal(body)

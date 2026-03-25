@@ -22,7 +22,7 @@ const emptyReplyMsg = "El agente especializado no pudo generar una respuesta. In
 
 // AgentCaller invokes a downstream agent.
 type AgentCaller interface {
-	InvokeAgent(ctx context.Context, agent, message string, sessionID int, idEmpresa int, configMap map[string]interface{}) (reply string, url *string, err error)
+	InvokeAgent(ctx context.Context, agent, message string, sessionID int, idEmpresa int, apiKey string, configMap map[string]interface{}) (reply string, url *string, err error)
 }
 
 // MetricsRecorder records request metrics.
@@ -142,7 +142,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	start := time.Now()
-	reply, url, err := h.Caller.InvokeAgent(agentCtx, agent, req.Message, req.SessionID, req.IdEmpresa, configMap)
+	reply, url, err := h.Caller.InvokeAgent(agentCtx, agent, req.Message, req.SessionID, req.IdEmpresa, req.ApiKey, configMap)
 	elapsed := time.Since(start)
 
 	status := "ok"

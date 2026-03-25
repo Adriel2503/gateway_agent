@@ -128,7 +128,7 @@ func (inv *Invoker) InvokeAgent(ctx context.Context, agent string, message strin
 			case <-time.After(500 * time.Millisecond):
 			}
 			slog.Debug("retry agente", "url", agentURL, "err", err)
-			return inv.doHTTP(ctx, agentURL, message, sessionID, idEmpresa, configMap)
+			return inv.doHTTP(ctx, agentURL, message, sessionID, idEmpresa, apiKey, configMap)
 		}
 		return result, err
 	})
